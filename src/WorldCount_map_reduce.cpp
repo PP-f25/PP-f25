@@ -1,4 +1,8 @@
+<<<<<<< HEAD
 #include <iostream>
+=======
+#include<iostream>
+>>>>>>> 9a100b9e2622780c7a535cd868af30f3dc9b03a5
 #include <stdio.h>
 #include <fstream>
 #include <sstream>
@@ -9,6 +13,7 @@
 #include <cstring>  
 #include <cctype>
 #include <map>
+<<<<<<< HEAD
 #include <algorithm>
 #include <iomanip> 
 #include <chrono> // 1. ? chrono
@@ -16,6 +21,8 @@
 // 蝘駁?? sys/time.h ??wtime() ?賣
 
 // --- ?閰??---
+=======
+>>>>>>> 9a100b9e2622780c7a535cd868af30f3dc9b03a5
 const char *stopwords[] = {"a", "about", 
     "above", "after", "again", "against", "ain",
     "all", "am", "an", "and", "any", "are", "aren", 
@@ -43,6 +50,7 @@ const char *stopwords[] = {"a", "about",
     "we've", "what", "when", "where", "which", "while", "who", "whom", "why",
     "will", "with", "won", "won't", "wouldn", "wouldn't", "y", "you", "you'd",
     "you'll", "your", "you're", "yours", "yourself", "yourselves", "you've",NULL};
+<<<<<<< HEAD
 
 std::unordered_set<std::string> stopwords_set;
 
@@ -63,39 +71,92 @@ const char *dataset_path[] = {
     // "../datasets/TheAdventuresOfTomSawyer_MarkTwain/TheAdventuresOfTomSawyer_MarkTwain_English.txt"
 };
 
+=======
+const char *dataset_path[] = {
+    "../datasets/AChristmasCarol_CharlesDickens/AChristmasCarol_CharlesDickens_English.txt"
+};
+
+bool is_stopword(char *word) {
+    for (int i = 0; stopwords[i] != NULL; i++) {
+        if (strcmp(stopwords[i], word) == 0) {
+            return true; 
+        }
+    }
+    return false; 
+}
+>>>>>>> 9a100b9e2622780c7a535cd868af30f3dc9b03a5
 struct KVPair {
     char* key; // 
     int value;
 };
+<<<<<<< HEAD
 
 //map
 std::vector<KVPair> map_seq(char* article_chunk) {
+=======
+struct ShuffledData {
+    char* key;
+    std::vector<int> values; //
+};
+//map
+std::vector<KVPair> map(char* article_chunk) {
+>>>>>>> 9a100b9e2622780c7a535cd868af30f3dc9b03a5
     std::vector<KVPair> mapped_data;
     const char* delimiters = " \t\n\r.,;:!?\"()[]{}<>-'";
     char* saveptr;
     
     char* token;
+<<<<<<< HEAD
     token = strtok_r(article_chunk, delimiters, &saveptr);
 
     while (token != NULL) {
+=======
+    token = strtok_r(article_chunk, delimiters, &saveptr); // )
+
+    while (token != NULL) {
+        // ... (tolower, strlen, is_stopword, isalnum) ...
+        
+>>>>>>> 9a100b9e2622780c7a535cd868af30f3dc9b03a5
         // turn to lower
         for (int i = 0; token[i]; i++) {
             token[i] = tolower(token[i]);
         }
 
+<<<<<<< HEAD
         // 1. ?蕪?瑕漲
         if (strlen(token) <= 2) {
+=======
+        // get the next token
+        if (strlen(token) <= 2) {
+            
+>>>>>>> 9a100b9e2622780c7a535cd868af30f3dc9b03a5
             token = strtok_r(NULL, delimiters, &saveptr);
             continue;
         }
 
+<<<<<<< HEAD
         // 3. ?蕪?急??詨??畾泵??閰?
         bool is_word_char = true;
         if (strlen(token) == 0) { 
+=======
+        // check if stop words
+        if (is_stopword(token)) {
+            token = strtok_r(NULL, delimiters, &saveptr);
+            continue;
+        }
+
+        // fliter out the word that has number or special char eg:123, c--
+        bool is_word_char = true;
+        if (strlen(token) == 0) { // strtok_r somtime generate empty token
+>>>>>>> 9a100b9e2622780c7a535cd868af30f3dc9b03a5
              is_word_char = false;
         }
 
         for (int i = 0; token[i]; i++) {
+<<<<<<< HEAD
+=======
+            // isalnum() check if alpha or num
+>>>>>>> 9a100b9e2622780c7a535cd868af30f3dc9b03a5
             if (!isalnum(token[i]) && token[i] != '_') { 
                 is_word_char = false;
                 break;
@@ -106,6 +167,7 @@ std::vector<KVPair> map_seq(char* article_chunk) {
             token = strtok_r(NULL, delimiters, &saveptr);
             continue;
         }
+<<<<<<< HEAD
         
         // 2. ?閰炎??
         std::string current_word(token);
@@ -115,6 +177,12 @@ std::vector<KVPair> map_seq(char* article_chunk) {
         }
 
         KVPair pair;
+=======
+        // "(Emit)" (key, 1)
+        KVPair pair;
+        // strdup = (malloc + strcpy)，to build a new memory
+        // 
+>>>>>>> 9a100b9e2622780c7a535cd868af30f3dc9b03a5
         pair.key = strdup(token); 
         pair.value = 1;
         
@@ -127,25 +195,47 @@ std::vector<KVPair> map_seq(char* article_chunk) {
 
 
 //shuffle
+<<<<<<< HEAD
 std::map<std::string, std::vector<int>> shuffle_seq(const std::vector<KVPair>& mapped_data) {
     std::map<std::string, std::vector<int>> shuffled_map;
 
     for (const auto& pair : mapped_data) {
         shuffled_map[std::string(pair.key)].push_back(pair.value);
+=======
+std::map<std::string, std::vector<int>> shuffle(const std::vector<KVPair>& mapped_data) {
+    
+    // use std::map 
+    //  sort by key
+    std::map<std::string, std::vector<int>> shuffled_map;
+
+    for (const auto& pair : mapped_data) {
+        // make  (key, 1) insert to  key  vector 
+        shuffled_map[std::string(pair.key)].push_back(pair.value);
+        
+        // release pair key;
+>>>>>>> 9a100b9e2622780c7a535cd868af30f3dc9b03a5
         free(pair.key); 
     }
     return shuffled_map;
 }
 
 //reduce
+<<<<<<< HEAD
 KVPair reduce_seq(const std::string& key, const std::vector<int>& values) {
+=======
+KVPair reduce(const std::string& key, const std::vector<int>& values) {
+>>>>>>> 9a100b9e2622780c7a535cd868af30f3dc9b03a5
     int sum = 0;
     for (int val : values) {
         sum += val;
     }
 
     KVPair result;
+<<<<<<< HEAD
     result.key = strdup(key.c_str());
+=======
+    result.key = strdup(key.c_str()); // 再次複製
+>>>>>>> 9a100b9e2622780c7a535cd868af30f3dc9b03a5
     result.value = sum;
     
     return result;
@@ -153,11 +243,17 @@ KVPair reduce_seq(const std::string& key, const std::vector<int>& values) {
 
 
 int main(){
+<<<<<<< HEAD
     initialize_stopwords_seq();
 
     std::cout << "Running sequential MapReduce version" << std::endl;
 
     // read file
+=======
+
+    // read file
+
+>>>>>>> 9a100b9e2622780c7a535cd868af30f3dc9b03a5
     std::ifstream ifs(dataset_path[0], std::ios::in);
     if (!ifs.is_open()) {
         std::cout << "Failed to open file.\n";
@@ -167,6 +263,7 @@ int main(){
     std::stringstream ss;
     ss << ifs.rdbuf();
     std::string str(ss.str());
+<<<<<<< HEAD
     ifs.close(); 
     
     char* article_buffer = strdup(str.c_str());
@@ -192,10 +289,30 @@ int main(){
     
     // 閮? Shuffle ??
     std::chrono::duration<double, std::milli> shuffle_duration = reduce_start_time - shuffle_start_time;
+=======
+    
+    ifs.close(); 
+
+    
+    std::unordered_map<std::string, int> word_counts;
+
+
+
+    // split it into words
+    char* token;
+    const char* delimiters = " \t\n\r.,;:!?\"()[]{}<>-'";
+
+    char* article_buffer = &str[0];
+    std::vector<KVPair> mapped_results = map(article_buffer);
+
+    // 2. Shuffle
+    std::map<std::string, std::vector<int>> shuffled_results = shuffle(mapped_results);
+>>>>>>> 9a100b9e2622780c7a535cd868af30f3dc9b03a5
     
     // 3. Reduce
     std::vector<KVPair> final_results;
     for (const auto& group : shuffled_results) {
+<<<<<<< HEAD
         final_results.push_back(reduce_seq(group.first, group.second));
     }
 
@@ -210,10 +327,18 @@ int main(){
     std::cout << "\n--- Word Count MapReduce Results (Sequential) ---" << std::endl;
     std::cout << std::fixed << std::setprecision(0); 
 
+=======
+        final_results.push_back(reduce(group.first, group.second));
+    }
+
+    // 4. print
+    std::cout << "--- Word Count Results ---" << std::endl;
+>>>>>>> 9a100b9e2622780c7a535cd868af30f3dc9b03a5
     for (auto& pair : final_results) {
         if (pair.value > 100) {
             std::cout << pair.key << ": " << pair.value << std::endl;
         }
+<<<<<<< HEAD
         free(pair.key);
     }
     
@@ -225,5 +350,10 @@ int main(){
     std::cout << "Reduce Time : " << reduce_duration.count() << " ms" << std::endl;
 
     free(article_buffer);
+=======
+        free(pair.key); // release reduce  key
+    }
+
+>>>>>>> 9a100b9e2622780c7a535cd868af30f3dc9b03a5
     return 0;
 }

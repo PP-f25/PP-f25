@@ -8,6 +8,10 @@
 /src/**/*.py
 /src/**/*.exe
 # 
+<<<<<<< HEAD
 /src/requeriments.txt
 
 Makefile
+=======
+/src/requeriments.txt
+>>>>>>> 9a100b9e2622780c7a535cd868af30f3dc9b03a5
