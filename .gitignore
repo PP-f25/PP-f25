@@ -1,0 +1,13 @@
+# 
+/report/*
+/.vscode/
+#
+/results/*
+
+# 
+/src/**/*.py
+/src/**/*.exe
+# 
+/src/requeriments.txt
+
+Makefile
