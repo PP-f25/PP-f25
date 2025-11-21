@@ -124,6 +124,7 @@ int main(){
     }
     // word count
     std::cout << "--- Word Count Results ---" << std::endl;
+
     for (const auto& pair : word_counts) {
         if (pair.second > 100) { // show that exceeds 100
             std::cout << pair.first << ": " << pair.second << std::endl;

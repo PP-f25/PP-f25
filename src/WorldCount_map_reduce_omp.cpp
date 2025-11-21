@@ -13,6 +13,8 @@
 #include <stdexcept>
 #include <unordered_set>
 #include <iomanip>
+#include <mutex>
+#include <chrono> // 引入 chrono
 
 // 停用詞列表
 const char * stopwords[] = {"a", "about",
@@ -45,15 +47,15 @@ const char * stopwords[] = {"a", "about",
 
 std::unordered_set<std::string> stopwords_set;
 
-// 資料集路徑列表 (全部解開註解)
+// 資料集路徑列表
 const char *dataset_path[] = {
-    "../datasets/AChristmasCarol_CharlesDickens/AChristmasCarol_CharlesDickens_English.txt",
-    "../datasets/KingSolomonsMines_HRiderHaggard/KingSolomonsMines_HRiderHaggard_English.txt",
-    "../datasets/OliverTwist_CharlesDickens/OliverTwist_CharlesDickens_English.txt",
+    // "../datasets/AChristmasCarol_CharlesDickens/AChristmasCarol_CharlesDickens_English.txt",
+    // "../datasets/KingSolomonsMines_HRiderHaggard/KingSolomonsMines_HRiderHaggard_English.txt",
+    // "../datasets/OliverTwist_CharlesDickens/OliverTwist_CharlesDickens_English.txt",
     "../datasets/Others/DonQuixote_MiguelCervantesSaavedra/DonQuixote_MiguelCervantesSaavedra_English.txt",
-    "../datasets/Others/NotreDameDeParis_VictorHugo/NotreDameDeParis_VictorHugo_English.txt",
-    "../datasets/Others/TheThreeMusketeers_AlexandreDumas/TheThreeMusketeers_AlexandreDumas_English.txt",
-    "../datasets/TheAdventuresOfTomSawyer_MarkTwain/TheAdventuresOfTomSawyer_MarkTwain_English.txt"
+    // "../datasets/Others/NotreDameDeParis_VictorHugo/NotreDameDeParis_VictorHugo_English.txt",
+    // "../datasets/Others/TheThreeMusketeers_AlexandreDumas/TheThreeMusketeers_AlexandreDumas_English.txt",
+    // "../datasets/TheAdventuresOfTomSawyer_MarkTwain/TheAdventuresOfTomSawyer_MarkTwain_English.txt"
 };
 
 void initialize_stopwords() {
@@ -129,26 +131,65 @@ std::vector<KVPair> map_func_optimized(const char* text, long start, long end) {
     return mapped_data;
 }
 
-std::map<std::string, std::vector<int>> shuffle(const std::vector<KVPair>& mapped_data) {
-    std::map<std::string, std::vector<int>> shuffled_map;
-    for (const auto& pair : mapped_data) {
-        shuffled_map[pair.key].push_back(pair.value);
+// 定義三維資料結構：[Producer_TID][PartitionID][Data]
+using PartitionedData = std::vector<std::vector<std::vector<KVPair>>>;
+
+void parallel_shuffle(const std::vector<std::vector<KVPair>>& map_outputs, 
+                      PartitionedData& all_thread_partitions, 
+                      int num_partitions) {
+    
+    int num_producers = map_outputs.size();
+
+    #pragma omp parallel num_threads(num_producers)
+    {
+        int tid = omp_get_thread_num();
+        
+        if (tid < num_producers) {
+            const auto& local_vec = map_outputs[tid]; 
+            
+            auto& my_partitions = all_thread_partitions[tid]; 
+            
+            for (const auto& kv : local_vec) {
+                std::size_t hash_val = std::hash<std::string>{}(kv.key);
+                int partition_idx = hash_val % num_partitions;
+                
+                my_partitions[partition_idx].push_back(kv);
+            }
+        }
     }
-    return shuffled_map;
 }
 
-KVPair reduce(const std::string& key, const std::vector<int>& values) {
-    int sum = 0;
-    for (int val : values) {
-        sum += val;
+std::vector<KVPair> parallel_reduce(const PartitionedData& all_thread_partitions, int num_partitions) {
+    int num_threads = all_thread_partitions.size();
+    std::vector<std::vector<KVPair>> thread_results(num_partitions);
+    
+    #pragma omp parallel for schedule(dynamic)
+    for (int p = 0; p < num_partitions; ++p) {
+        std::unordered_map<std::string, int> counts;
+        
+        for (int t = 0; t < num_threads; ++t) {
+            const auto& data_chunk = all_thread_partitions[t][p];
+            for (const auto& kv : data_chunk) {
+                counts[kv.key] += kv.value;
+            }
+        }
+        
+        thread_results[p].reserve(counts.size());
+        for (const auto& pair : counts) {
+            thread_results[p].push_back(KVPair{pair.first, pair.second});
+        }
     }
-    return KVPair{key, sum};
+    
+    std::vector<KVPair> final_results;
+    for (const auto& res : thread_results) {
+        final_results.insert(final_results.end(), res.begin(), res.end());
+    }
+    return final_results;
 }
 
 int main(int argc, char *argv[]){
     initialize_stopwords();
 
-    // 1. 解析命令列參數
     int user_threads = omp_get_max_threads();
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
@@ -159,47 +200,36 @@ int main(int argc, char *argv[]){
     int max_threads = omp_get_max_threads();
     if (user_threads > max_threads) user_threads = max_threads;
 
-    std::cout << "Running MapReduce with " << user_threads << " threads..." << std::endl;
+    std::cout << "Running FULL PARALLEL MapReduce with " << user_threads << " threads (Chrono Timer)..." << std::endl;
 
-    // 計算資料集數量
     int num_datasets = sizeof(dataset_path) / sizeof(dataset_path[0]);
     
-    // --- 針對每個檔案進行迴圈 ---
     for (int d = 0; d < num_datasets; ++d) {
-        
-        // 為了美觀，印出當前處理的檔案名稱
         std::string filepath = dataset_path[d];
-        // 只取檔名部分 (移除路徑)
         std::string filename = filepath.substr(filepath.find_last_of("/\\") + 1);
-        
         std::cout << "\n>>> Processing: " << filename << std::endl;
 
-        // 2. 讀取檔案
         std::ifstream ifs(dataset_path[d], std::ios::in);
         if (!ifs.is_open()) {
             std::cerr << "Failed to open file: " << dataset_path[d] << std::endl;
-            continue; // 如果開檔失敗，跳過此檔案，繼續下一個
+            continue; 
         }
-
         std::stringstream ss;
         ss << ifs.rdbuf();
         std::string content(ss.str());
         ifs.close(); 
         
-        if (content.empty()) {
-            std::cerr << "File is empty: " << filename << std::endl;
-            continue;
-        }
+        if (content.empty()) continue;
         
         const char* text = content.c_str();
         long total_length = content.length();
         
+        // --- Map Phase ---
         std::vector<std::vector<KVPair>> thread_mapped_results(user_threads);
+        
+        // chrono start
+        auto map_start = std::chrono::high_resolution_clock::now();
 
-        // --- 開始 Map 計時 ---
-        double map_start_time = omp_get_wtime();
-
-        // 3. 優化的 Parallel Map 階段
         #pragma omp parallel num_threads(user_threads)
         {
             int tid = omp_get_thread_num();
@@ -216,55 +246,45 @@ int main(int argc, char *argv[]){
                 thread_mapped_results[tid] = map_func_optimized(text, start_index, end_index);
             }
         }
+        
+        auto map_end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::milli> map_elapsed = map_end - map_start;
+        
+        // --- Parallel Shuffle Phase ---
+        auto shuffle_start = std::chrono::high_resolution_clock::now();
 
-        // 4. 彙總 Map 結果
-        std::vector<KVPair> mapped_results;
-        size_t total_size = 0;
-        for (const auto& local_vec : thread_mapped_results) total_size += local_vec.size();
-        mapped_results.reserve(total_size);
+        PartitionedData partitions(user_threads, std::vector<std::vector<KVPair>>(user_threads));
+        parallel_shuffle(thread_mapped_results, partitions, user_threads);
         
-        for (const auto& local_vec : thread_mapped_results) {
-            mapped_results.insert(mapped_results.end(), local_vec.begin(), local_vec.end());
-        }
+        auto shuffle_end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::milli> shuffle_elapsed = shuffle_end - shuffle_start;
+        
+        // --- Parallel Reduce Phase ---
+        auto reduce_start = std::chrono::high_resolution_clock::now();
 
-        // --- 結束 Map 計時，開始 Shuffle 計時 ---
-        double shuffle_start_time = omp_get_wtime();
-        double map_time_ms = (shuffle_start_time - map_start_time) * 1000.0;
+        std::vector<KVPair> final_results = parallel_reduce(partitions, user_threads);
         
-        // 5. Shuffle
-        std::map<std::string, std::vector<int>> shuffled_results = shuffle(mapped_results);
-        
-        // --- 結束 Shuffle 計時，開始 Reduce 計時 ---
-        double reduce_start_time = omp_get_wtime();
-        double shuffle_time_ms = (reduce_start_time - shuffle_start_time) * 1000.0;
-        
-        // 6. Reduce
-        std::vector<KVPair> final_results;
-        final_results.reserve(shuffled_results.size());
-        for (const auto& group : shuffled_results) {
-            final_results.push_back(reduce(group.first, group.second));
-        }
-        
-        // --- 結束 Reduce 計時 ---
-        double end_time = omp_get_wtime();
-        double reduce_time_ms = (end_time - reduce_start_time) * 1000.0;
+        auto reduce_end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::milli> reduce_elapsed = reduce_end - reduce_start;
 
-        // 7. 輸出結果
-        std::cout << "--- Word Count map reduce Results ---" << std::endl;
+        // 總時間
+        std::chrono::duration<double, std::milli> total_elapsed = reduce_end - map_start;
 
-    
-        std::cout << std::fixed << std::setprecision(0);
+        std::cout << "--- Word Count Results (Top 5 for verify) ---" << std::endl;
+        int count = 0;
         for (auto& pair : final_results) {
             if (pair.value > 100) {
                 std::cout << pair.key << ": " << pair.value << std::endl;
+               count++;
             }
         }
+        std::cout << "Total unique words > 100: " << count << std::endl;
 
         std::cout << std::fixed << std::setprecision(3);
-        std::cout << "Map Time: " << map_time_ms << " ms" << std::endl;
-        std::cout << "Shuffle Time: " << shuffle_time_ms << " ms" << std::endl;
-        std::cout << "Reduce Time : " << reduce_time_ms << " ms" << std::endl;
+        std::cout << "Map Time    : " << map_elapsed.count() << " ms" << std::endl;
+        std::cout << "Shuffle Time: " << shuffle_elapsed.count() << " ms" << std::endl;
+        std::cout << "Reduce Time : " << reduce_elapsed.count() << " ms" << std::endl;
+        std::cout << "Total Time  : " << total_elapsed.count() << " ms" << std::endl;
     }
-    
     return 0;
 }
