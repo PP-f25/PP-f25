@@ -49,10 +49,12 @@ const char *dataset_path[] = {
     // "../datasets/AChristmasCarol_CharlesDickens/AChristmasCarol_CharlesDickens_English.txt",
     // "../datasets/KingSolomonsMines_HRiderHaggard/KingSolomonsMines_HRiderHaggard_English.txt",
     // "../datasets/OliverTwist_CharlesDickens/OliverTwist_CharlesDickens_English.txt",
-    "../datasets/Others/DonQuixote_MiguelCervantesSaavedra/DonQuixote_MiguelCervantesSaavedra_English.txt",
+    //  "../datasets/Others/DonQuixote_MiguelCervantesSaavedra/DonQuixote_MiguelCervantesSaavedra_English.txt",
     // "../datasets/Others/NotreDameDeParis_VictorHugo/NotreDameDeParis_VictorHugo_English.txt",
     // "../datasets/Others/TheThreeMusketeers_AlexandreDumas/TheThreeMusketeers_AlexandreDumas_English.txt",
     // "../datasets/TheAdventuresOfTomSawyer_MarkTwain/TheAdventuresOfTomSawyer_MarkTwain_English.txt",
+    // "../archive/text8"
+    "../enwik9/enwik9"
 };
 
 void initialize_stopwords() {
@@ -221,14 +223,15 @@ int main(int argc, char* argv[]) {
         }
     }
     
-    std::cout << "Running WorldCount (Pthreads Optimized - Lock Free) with " << num_threads << " threads (Chrono Timer)" << std::endl;
+    // 
+    // std::cout << "Running WorldCount (Pthreads Optimized - Lock Free) with " << num_threads << " threads (Chrono Timer)" << std::endl;
 
     int num_datasets = sizeof(dataset_path) / sizeof(dataset_path[0]);
 
     for (int d = 0; d < num_datasets; ++d) {
         std::string filepath = dataset_path[d];
         std::string filename = filepath.substr(filepath.find_last_of("/\\") + 1);
-        std::cout << "\n>>> Processing: " << filename << std::endl;
+        // std::cout << "\n>>> Processing: " << filename << std::endl;
 
         std::ifstream ifs(dataset_path[d], std::ios::in);
         if (!ifs.is_open()) {
@@ -341,17 +344,17 @@ int main(int argc, char* argv[]) {
         std::cout << "--- Word Count MapReduce Results (Verify) ---" << std::endl;
         int count = 0;
         for (auto& pair : final_results) {
-            if (pair.value > 100) {
+            if (pair.value > 100000) {
                 count++;
             }
         }
-        std::cout << "Total unique words > 100: " << count << std::endl;
+        // std::cout << "Total unique words > 100: " << count << std::endl;
 
         std::cout << std::fixed << std::setprecision(3);
+        std::cout << "Total Time  : " << total_elapsed.count() << " ms" << std::endl;
         std::cout << "Map Time    : " << map_elapsed.count() << " ms" << std::endl;
         std::cout << "Shuffle Time: " << shuffle_elapsed.count() << " ms" << std::endl;
         std::cout << "Reduce Time : " << reduce_elapsed.count() << " ms" << std::endl;
-        std::cout << "Total Time  : " << total_elapsed.count() << " ms" << std::endl;
 
         // 清理
         delete[] map_threads;

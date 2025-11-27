@@ -52,10 +52,12 @@ const char *dataset_path[] = {
     // "../datasets/AChristmasCarol_CharlesDickens/AChristmasCarol_CharlesDickens_English.txt",
     // "../datasets/KingSolomonsMines_HRiderHaggard/KingSolomonsMines_HRiderHaggard_English.txt",
     // "../datasets/OliverTwist_CharlesDickens/OliverTwist_CharlesDickens_English.txt",
-    "../datasets/Others/DonQuixote_MiguelCervantesSaavedra/DonQuixote_MiguelCervantesSaavedra_English.txt",
+    //"../datasets/Others/DonQuixote_MiguelCervantesSaavedra/DonQuixote_MiguelCervantesSaavedra_English.txt",
     // "../datasets/Others/NotreDameDeParis_VictorHugo/NotreDameDeParis_VictorHugo_English.txt",
     // "../datasets/Others/TheThreeMusketeers_AlexandreDumas/TheThreeMusketeers_AlexandreDumas_English.txt",
     // "../datasets/TheAdventuresOfTomSawyer_MarkTwain/TheAdventuresOfTomSawyer_MarkTwain_English.txt"
+    // "../archive/text8"
+    "../enwik9/enwik9"
 };
 
 void initialize_stopwords() {
@@ -273,18 +275,19 @@ int main(int argc, char *argv[]){
         std::cout << "--- Word Count Results (Top 5 for verify) ---" << std::endl;
         int count = 0;
         for (auto& pair : final_results) {
-            if (pair.value > 100) {
+            if (pair.value > 100000) {
                 std::cout << pair.key << ": " << pair.value << std::endl;
                count++;
             }
         }
-        std::cout << "Total unique words > 100: " << count << std::endl;
+        // std::cout << "Total unique words > 100: " << count << std::endl;
 
         std::cout << std::fixed << std::setprecision(3);
+        std::cout << "Total Time  : " << total_elapsed.count() << " ms" << std::endl;
         std::cout << "Map Time    : " << map_elapsed.count() << " ms" << std::endl;
         std::cout << "Shuffle Time: " << shuffle_elapsed.count() << " ms" << std::endl;
         std::cout << "Reduce Time : " << reduce_elapsed.count() << " ms" << std::endl;
-        std::cout << "Total Time  : " << total_elapsed.count() << " ms" << std::endl;
+        
     }
     return 0;
 }

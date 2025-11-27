@@ -5,6 +5,7 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <cstring>
 #include <cctype>
 #include <chrono>
@@ -37,9 +38,26 @@ const char *stopwords[] = {"a", "about",
     "will", "with", "won", "won't", "wouldn", "wouldn't", "y", "you", "you'd",
     "you'll", "your", "you're", "yours", "yourself", "yourselves", "you've",NULL};
 
+std::unordered_set<std::string> stopwords_set;
+
+void initialize_stopwords_seq() {
+    if (stopwords_set.empty()) {
+        for (int i = 0; stopwords[i] != NULL; i++) {
+            stopwords_set.insert(stopwords[i]);
+        }
+    }
+}
+
+bool is_stopword_fast_seq(const std::string& word) {
+    return stopwords_set.count(word) > 0; 
+}
+
 const char *dataset_path[] = {
-    "datasets/AChristmasCarol_CharlesDickens/AChristmasCarol_CharlesDickens_English.txt"
+    // "../datasets/AChristmasCarol_CharlesDickens/AChristmasCarol_CharlesDickens_English.txt"
+    //"../datasets/Others/DonQuixote_MiguelCervantesSaavedra/DonQuixote_MiguelCervantesSaavedra_English.txt"
+    "../archive/text8"
 };
+
 bool is_stopword(char *word) {
     for (int i = 0; stopwords[i] != NULL; i++) {
         if (strcmp(stopwords[i], word) == 0) {
@@ -139,11 +157,6 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        if (is_stopword(token)) {
-            token = strtok_r(NULL, delimiters, &saveptr);
-            continue;
-        }
-
         bool is_word_char = true;
         if (strlen(token) == 0) {
             is_word_char = false;
@@ -154,7 +167,14 @@ int main(int argc, char** argv) {
                 break;
             }
         }
+
         if (!is_word_char) {
+            token = strtok_r(NULL, delimiters, &saveptr);
+            continue;
+        }
+
+        std::string current_word(token);
+        if (is_stopword_fast_seq(current_word)) {
             token = strtok_r(NULL, delimiters, &saveptr);
             continue;
         }
@@ -227,7 +247,7 @@ int main(int argc, char** argv) {
 
         std::cout << "--- Word Count (MPI) Results ---\n";
         for (auto &p : global_counts) {
-            if (p.second > 100) {
+            if (p.second > 100000) {
                 std::cout << p.first << ": " << p.second << std::endl;
             }
         }

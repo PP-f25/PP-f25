@@ -8,6 +8,9 @@
 #include <unordered_set>
 #include <cstring>  
 #include <cctype>
+#include <time.h>
+#include <chrono>
+
 const char *stopwords[] = {"a", "about", 
     "above", "after", "again", "against", "ain",
     "all", "am", "an", "and", "any", "are", "aren", 
@@ -36,7 +39,9 @@ const char *stopwords[] = {"a", "about",
     "will", "with", "won", "won't", "wouldn", "wouldn't", "y", "you", "you'd",
     "you'll", "your", "you're", "yours", "yourself", "yourselves", "you've",NULL};
 const char *dataset_path[] = {
-    "../datasets/AChristmasCarol_CharlesDickens/AChristmasCarol_CharlesDickens_English.txt"
+    // "datasets/AChristmasCarol_CharlesDickens/AChristmasCarol_CharlesDickens_English.txt"
+    // "../archive/text8"
+    "../enwik9/enwik9"
 };
 
 bool is_stopword(char *word) {
@@ -51,7 +56,7 @@ bool is_stopword(char *word) {
 int main(){
 
     // read file
-
+    auto total_start = std::chrono::high_resolution_clock::now();
     std::ifstream ifs(dataset_path[0], std::ios::in);
     if (!ifs.is_open()) {
         std::cout << "Failed to open file.\n";
@@ -61,7 +66,7 @@ int main(){
     std::stringstream ss;
     ss << ifs.rdbuf();
     std::string str(ss.str());
-    std::cout << str;
+   // std::cout << str;
     ifs.close(); 
 
     
@@ -77,6 +82,8 @@ int main(){
 
     char* saveptr;
     token = strtok_r(article_buffer, delimiters, &saveptr);
+
+    auto reduce_start = std::chrono::high_resolution_clock::now();
 
     while ((token !=NULL)) {
         // 'token' 
@@ -102,7 +109,7 @@ int main(){
         // fliter out the word that has number or special char eg:123, c--
         bool is_word_char = true;
         if (strlen(token) == 0) { // strtok_r somtime generate empty token
-             is_word_char = false;
+            is_word_char = false;
         }
 
         for (int i = 0; token[i]; i++) {
@@ -122,13 +129,21 @@ int main(){
         // 4. 
         
     }
+
+    auto reduce_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> reduce_time = reduce_end - reduce_start;
+    auto total_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> total_time = total_end - total_start;
+
     // word count
     std::cout << "--- Word Count Results ---" << std::endl;
-
     for (const auto& pair : word_counts) {
-        if (pair.second > 100) { // show that exceeds 100
+        if (pair.second > 100000) { // show that exceeds 100
             std::cout << pair.first << ": " << pair.second << std::endl;
         }
     }
+
+    std::cout << "Total Time : " << total_time.count() << " ms" << std::endl;
+    std::cout << "Reduce Time : " << reduce_time.count() << " ms" << std::endl;
     return 0;
 }

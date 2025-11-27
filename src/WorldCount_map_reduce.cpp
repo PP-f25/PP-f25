@@ -11,11 +11,8 @@
 #include <map>
 #include <algorithm>
 #include <iomanip> 
-#include <chrono> // 1. ? chrono
+#include <chrono> 
 
-// 蝘駁?? sys/time.h ??wtime() ?賣
-
-// --- ?閰??---
 const char *stopwords[] = {"a", "about", 
     "above", "after", "again", "against", "ain",
     "all", "am", "an", "and", "any", "are", "aren", 
@@ -59,8 +56,10 @@ bool is_stopword_fast_seq(const std::string& word) {
 }
 const char *dataset_path[] = {
     // "../datasets/AChristmasCarol_CharlesDickens/AChristmasCarol_CharlesDickens_English.txt"
-    "../datasets/Others/DonQuixote_MiguelCervantesSaavedra/DonQuixote_MiguelCervantesSaavedra_English.txt"
+    //"../datasets/Others/DonQuixote_MiguelCervantesSaavedra/DonQuixote_MiguelCervantesSaavedra_English.txt"
     // "../datasets/TheAdventuresOfTomSawyer_MarkTwain/TheAdventuresOfTomSawyer_MarkTwain_English.txt"
+    "../enwik9/enwik9"
+    // "../archive/text8"
 };
 
 struct KVPair {
@@ -212,7 +211,7 @@ int main(){
     std::cout << std::fixed << std::setprecision(0); 
 
     for (auto& pair : final_results) {
-        if (pair.value > 100) {
+        if (pair.value > 100000) {
             std::cout << pair.key << ": " << pair.value << std::endl;
         }
         free(pair.key);

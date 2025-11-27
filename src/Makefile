@@ -1,56 +1,169 @@
-# Compiler settings
-CXX = g++
-NVCC = nvcc
-CXXFLAGS = -std=c++11 -O3
-# Note: Adjust -arch based on your GPU (sm_50 for GTX 950M, sm_60 for GTX 1060, etc.)
-NVCCFLAGS = -std=c++11 -O3 -arch=sm_50
+# ==========================================
+# 整合版 Makefile: Pthread, OpenMP, MPI, CUDA
+# ==========================================
 
-# Targets
-all: sequential mapreduce cuda
+# --- 編譯器設定 ---
+CXX      = g++
+MPICXX   = mpicxx
+NVCC     = nvcc
 
-# Sequential version
-sequential:
-	@echo "Building sequential version..."
-	@$(CXX) $(CXXFLAGS) WorldCount.cpp -o WorldCount.out
-	@echo "Running sequential version..."
-	@./WorldCount.out
+# --- 編譯旗標 ---
+# 一般 C++ (C++17, O3 優化)
+CXXFLAGS = -std=c++17 -O3 -Wall -g -fPIC -I./common -Iobjs/ -lm
+# OpenMP
+OMPFLAGS = -fopenmp
+# Pthread
+PTHREADFLAGS = -pthread
 
-# MapReduce version
-mapreduce:
-	@echo "Building MapReduce version..."
-	@$(CXX) $(CXXFLAGS) WorldCount_map_reduce.cpp -o WorldCount_map_reduce.out
-	@echo "Running MapReduce version..."
-	@./WorldCount_map_reduce.out
+# CUDA (依你的 GPU 調整 compute_xx / sm_xx)
+CUDA_COMPILE_FLAGS = --device-c -gencode=arch=compute_61,code=sm_61 -Xcompiler "-fPIC" -g -O3
+CUDA_LINK_FLAGS    = -rdc=true -gencode=arch=compute_61,code=sm_61 -Xcompiler "-fPIC"
 
-# CUDA version
-cuda:
-	@echo "Building CUDA version..."
-	@$(NVCC) $(NVCCFLAGS) WorldCount_cuda.cu -o WorldCount_cuda.out
-	@echo "Running CUDA version..."
-	@./WorldCount_cuda.out
+# --- 路徑與資料夾 ---
+OBJDIR    = objs
+COMMONDIR = ./common
 
-# Run only CUDA version
-run-cuda:
-	@./WorldCount_cuda.out
+# ==========================================
+# WorldCount / MapReduce / MPI 區
+# ==========================================
 
-# Build only CUDA version
-build-cuda:
-	@echo "Building CUDA version..."
-	@$(NVCC) $(NVCCFLAGS) WorldCount_cuda.cu -o WorldCount_cuda.out
+SEQ_SRC     = WorldCount_sequential.cpp
+MR_SRC      = WorldCount_map_reduce.cpp
+PTH_SRC     = WorldCount_map_reduce_pthread.cpp
+OMP_SRC     = WorldCount_map_reduce_omp.cpp
+MPI_SRC     = WorldCountMPI.cpp
+MPI_MR_SRC  = WorldCount_map_reduce_mpi.cpp
 
-# Clean all executables
+SEQ_BIN     = WorldCount_sequential
+MR_BIN      = WorldCount_map_reduce
+PTH_BIN     = WorldCount_map_reduce_pthread
+OMP_BIN     = WorldCount_map_reduce_omp
+MPI_BIN     = WorldCountMPI
+MPI_MR_BIN  = WorldCount_map_reduce_mpi
+
+# ==========================================
+# CUDA 區（從你的 Makefilecuda 合併而來）
+# ==========================================
+
+# CUDA 執行檔名字：**這裡改成你想要的名字**
+# 例如：CUDA_APP = hw5_cuda  或  CUDA_APP = mandelbrot
+CUDA_APP = cuda_app
+
+# 通常不用動：common/ppm.cpp
+PPM_SRC = $(COMMONDIR)/ppm.cpp
+PPM_OBJ = $(OBJDIR)/ppm.o
+
+# 這邊照你原本 Makefilecuda 寫的物件檔。
+# 如果你的 .cpp 檔名跟這些不一樣，就改這裡。
+CUDA_OBJS = \
+	$(OBJDIR)/main.o \
+	$(OBJDIR)/kernel.o \
+	$(OBJDIR)/mandelbrotSerial.o \
+	$(OBJDIR)/mandelbrotThread.o \
+	$(PPM_OBJ)
+
+# MPI 預設執行緒數量
+NP ?= 4
+
+# ==========================================
+# 主要目標 / phony targets
+# ==========================================
+
+.PHONY: all clean dirs \
+	run_all run_seq run_mr run_pth run_omp run_mpi run_cuda
+
+# 一次編所有東西
+all: dirs \
+	$(SEQ_BIN) $(MR_BIN) $(PTH_BIN) $(OMP_BIN) \
+	$(MPI_BIN) $(MPI_MR_BIN) \
+	$(CUDA_APP)
+
+# 建立物件檔資料夾
+dirs:
+	/bin/mkdir -p $(OBJDIR)/
+
+# ===========================
+# 編譯規則: World Count (CPU)
+# ===========================
+
+$(SEQ_BIN): $(SEQ_SRC)
+	$(CXX) $(CXXFLAGS) -o $@ $<
+
+$(MR_BIN): $(MR_SRC)
+	$(CXX) $(CXXFLAGS) -o $@ $<
+
+$(PTH_BIN): $(PTH_SRC)
+	$(CXX) $(CXXFLAGS) $(PTHREADFLAGS) -o $@ $<
+
+$(OMP_BIN): $(OMP_SRC)
+	$(CXX) $(CXXFLAGS) $(OMPFLAGS) -o $@ $<
+
+$(MPI_BIN): $(MPI_SRC)
+	$(MPICXX) $(CXXFLAGS) -o $@ $<
+
+$(MPI_MR_BIN): $(MPI_MR_SRC)
+	$(MPICXX) $(CXXFLAGS) -o $@ $<
+
+# ===========================
+# 編譯規則: CUDA
+# ===========================
+
+# 最終 CUDA 執行檔
+$(CUDA_APP): dirs $(CUDA_OBJS)
+	$(NVCC) $(CUDA_LINK_FLAGS) -o $@ $(CUDA_OBJS) mandelbrotThreadRef.a
+
+# 一般 C++ -> .o（含 CUDA 專案用的 .cpp）
+$(OBJDIR)/%.o: %.cpp
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
+
+# common/*.cpp -> .o
+$(OBJDIR)/%.o: $(COMMONDIR)/%.cpp
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
+
+# main.cpp 依賴 common/CycleTimer.h
+$(OBJDIR)/main.o: main.cpp $(COMMONDIR)/CycleTimer.h
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
+
+# kernel.cu -> kernel.o
+$(OBJDIR)/kernel.o: kernel.cu kernel.h
+	$(NVCC) $(CUDA_COMPILE_FLAGS) -c kernel.cu -o $@
+
+# ===========================
+# 執行規則 (Run Targets)
+# ===========================
+
+run_all: run_seq run_mr run_pth run_omp run_mpi run_cuda
+
+run_seq: $(SEQ_BIN)
+	@echo ">>> Running Sequential"
+	./$(SEQ_BIN)
+
+run_mr: $(MR_BIN)
+	@echo ">>> Running MapReduce (sequential)"
+	./$(MR_BIN)
+
+run_pth: $(PTH_BIN)
+	@echo ">>> Running Pthread"
+	./$(PTH_BIN)
+
+run_omp: $(OMP_BIN)
+	@echo ">>> Running OpenMP"
+	./$(OMP_BIN)
+
+run_mpi: $(MPI_BIN) $(MPI_MR_BIN)
+	@echo ">>> Running MPI (basic) with $(NP) processes"
+	mpirun -np $(NP) ./$(MPI_BIN)
+	@echo ">>> Running MPI (MapReduce) with $(NP) processes"
+	mpirun -np $(NP) ./$(MPI_MR_BIN)
+
+# run_cuda: $(CUDA_APP)
+# 	@echo ">>> Running CUDA app: $(CUDA_APP)"
+# 	./$(CUDA_APP)
+
+# ===========================
+# 清除
+# ===========================
+
 clean:
-	@rm -f *.out
-
-# Help
-help:
-	@echo "Available targets:"
-	@echo "  all        - Build and run all versions"
-	@echo "  sequential - Build and run sequential version"
-	@echo "  mapreduce  - Build and run MapReduce version"
-	@echo "  cuda       - Build and run CUDA version"
-	@echo "  build-cuda - Build CUDA version only"
-	@echo "  run-cuda   - Run CUDA version only"
-	@echo "  clean      - Remove all executables"
-
-.PHONY: all sequential mapreduce cuda run-cuda build-cuda clean help
+	rm -f $(SEQ_BIN) $(MR_BIN) $(PTH_BIN) $(OMP_BIN) $(MPI_BIN) $(MPI_MR_BIN) $(CUDA_APP)
+	rm -rf $(OBJDIR) *.ppm *.out
