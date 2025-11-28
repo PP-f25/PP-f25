@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cctype>
 #include <algorithm>
+#include <chrono>
 #include <cuda_runtime.h>
 #include <thrust/device_vector.h>
 #include <thrust/sort.h>
@@ -49,7 +50,7 @@ const char *stopwords[] = {"a", "about",
     "you'll", "your", "you're", "yours", "yourself", "yourselves", "you've", NULL};
 
 const char *dataset_path[] = {
-    "../datasets/AChristmasCarol_CharlesDickens/AChristmasCarol_CharlesDickens_English.txt"
+    "../datasets/Others/DonQuixote_MiguelCervantesSaavedra/DonQuixote_MiguelCervantesSaavedra_English.txt"
 };
 
 // ==================== Device Constant Memory ====================
@@ -184,117 +185,89 @@ __device__ bool is_stopword_gpu(const char* word, int len) {
 // ==================== CUDA Kernels ====================
 
 /**
- * MAP Kernel: 修正版本
+ * 階段 1: 找出所有單詞的起始位置
  */
-__global__ void map_kernel(char* text, int text_length, 
-                          WordCount* map_output, int* output_count,
-                          int max_output_size) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_threads = gridDim.x * blockDim.x;
+__global__ void find_word_boundaries(char* text, int text_length, 
+                                     int* word_starts, int* word_count) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
-    // 每個 thread 處理一段文本
-    int chunk_size = (text_length + total_threads - 1) / total_threads;
-    int start = tid * chunk_size;
-    int end = min(start + chunk_size, text_length);
+    if (idx >= text_length) return;
     
-    if (start >= text_length) return;
+    // 檢查這個位置是否是單詞的開始
+    // 單詞開始的條件：當前字符不是分隔符，且前一個字符是分隔符（或是文本開頭）
+    bool is_word_start = false;
     
-    // 關鍵修正：每個 thread 只處理「開始於」它範圍內的單詞
-    // 如果 start 在單詞中間，跳到下一個單詞的開始
-    if (tid > 0 && start > 0 && !is_delimiter(text[start - 1])) {
-        // 我們在單詞中間，跳過這個單詞（讓前一個 thread 處理它）
-        while (start < text_length && !is_delimiter(text[start])) {
-            start++;
+    if (idx == 0) {
+        // 文本開頭，如果不是分隔符就是單詞開始
+        if (!is_delimiter(text[idx])) {
+            is_word_start = true;
         }
-        // 現在 start 指向分隔符，跳過所有連續的分隔符
-        while (start < text_length && is_delimiter(text[start])) {
-            start++;
+    } else {
+        // 前一個是分隔符，當前不是分隔符
+        if (is_delimiter(text[idx - 1]) && !is_delimiter(text[idx])) {
+            is_word_start = true;
         }
     }
     
-    // 不要延伸 end！只處理嚴格在 [start, end) 範圍內開始的單詞
-    // 如果單詞跨越 end 邊界，也要完整處理（讀取到單詞結尾）
-    // 但不要延伸 end 本身，避免與下一個 thread 重疊
+    // 如果是單詞開始，記錄位置
+    if (is_word_start) {
+        int pos = atomicAdd(word_count, 1);
+        word_starts[pos] = idx;
+    }
+}
+
+/**
+ * 階段 2: 處理每個單詞
+ */
+__global__ void process_words(char* text, int text_length,
+                              int* word_starts, int num_words,
+                              WordCount* map_output, int* output_count,
+                              int max_output_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
-    // 處理這段文本中的單詞
-    char word_buffer[MAX_WORD_LENGTH];
+    if (idx >= num_words) return;
+    
+    int start_pos = word_starts[idx];
+    
+    // 計算單詞長度
     int word_len = 0;
-    int word_start_pos = start;  // 記錄當前單詞的開始位置
-    
-    // 處理從 start 到 end 的範圍
-    // 策略：只處理「開始位置」在 [start, end) 內的單詞
-    for (int i = start; i < text_length; i++) {
-        char c = text[i];
-        
-        if (is_delimiter(c)) {
-            // 單詞結束
-            if (word_len > 0) {
-                // 檢查這個單詞是否「開始」於我們的範圍內
-                if (word_start_pos < end) {
-                    word_buffer[word_len] = '\0';
-                    
-                    // 轉小寫
-                    char lower_word[MAX_WORD_LENGTH];
-                    to_lowercase(lower_word, word_buffer, word_len);
-                    
-                    // 檢查是否為合法單詞（無數字、特殊字元）
-                    if (is_valid_word(lower_word, word_len)) {
-                        // 檢查是否為 stopword
-                        if (!is_stopword_gpu(lower_word, word_len)) {
-                            // Emit (word, 1)
-                            int idx = atomicAdd(output_count, 1);
-                            
-                            if (idx < max_output_size) {
-                                for (int j = 0; j <= word_len && j < MAX_WORD_LENGTH; j++) {
-                                    map_output[idx].word[j] = lower_word[j];
-                                }
-                                map_output[idx].count = 1;
-                            }
-                        }
-                    }
-                }
-                
-                word_len = 0;
-            }
-            
-            // 如果已經超過我們的範圍，可以停止了
-            if (i >= end) {
-                break;
-            }
-            
-            // 下一個單詞會從這裡開始
-            word_start_pos = i + 1;
-        } else {
-            // 建構單詞
-            if (word_len == 0) {
-                // 新單詞開始
-                word_start_pos = i;
-            }
-            if (word_len < MAX_WORD_LENGTH - 1) {
-                word_buffer[word_len++] = c;
-            }
-        }
+    while (start_pos + word_len < text_length && 
+           !is_delimiter(text[start_pos + word_len]) && 
+           word_len < MAX_WORD_LENGTH - 1) {
+        word_len++;
     }
     
-    // 處理最後一個單詞（如果文本結尾沒有分隔符）
-    if (word_len > 0 && word_start_pos < end) {
-        word_buffer[word_len] = '\0';
-        
-        char lower_word[MAX_WORD_LENGTH];
-        to_lowercase(lower_word, word_buffer, word_len);
-        
-        if (is_valid_word(lower_word, word_len)) {
-            if (!is_stopword_gpu(lower_word, word_len)) {
-                int idx = atomicAdd(output_count, 1);
-                
-                if (idx < max_output_size) {
-                    for (int j = 0; j <= word_len && j < MAX_WORD_LENGTH; j++) {
-                        map_output[idx].word[j] = lower_word[j];
-                    }
-                    map_output[idx].count = 1;
-                }
-            }
+    if (word_len == 0) return;
+    
+    // 轉小寫
+    char lower_word[MAX_WORD_LENGTH];
+    for (int i = 0; i < word_len; i++) {
+        char c = text[start_pos + i];
+        if (c >= 'A' && c <= 'Z') {
+            lower_word[i] = c + 32;
+        } else {
+            lower_word[i] = c;
         }
+    }
+    lower_word[word_len] = '\0';
+    
+    // 檢查是否為合法單詞
+    if (!is_valid_word(lower_word, word_len)) {
+        return;
+    }
+    
+    // 檢查是否為 stopword
+    if (is_stopword_gpu(lower_word, word_len)) {
+        return;
+    }
+    
+    // 輸出 (word, 1)
+    int out_idx = atomicAdd(output_count, 1);
+    if (out_idx < max_output_size) {
+        for (int i = 0; i <= word_len && i < MAX_WORD_LENGTH; i++) {
+            map_output[out_idx].word[i] = lower_word[i];
+        }
+        map_output[out_idx].count = 1;
     }
 }
 
@@ -337,106 +310,104 @@ void mapreduce_wordcount(const std::string& text) {
     
     copy_stopwords_to_device();
     
-    // 分配 map 輸出空間
-    int max_map_output = text_length / 3;
+    // ============ PHASE 1: MAP (兩階段法) ============
+    printf("Phase 1: MAP - Extracting words (Two-Phase Method)...\n");
+    
+    // 開始 Map 階段計時
+    auto map_start_time = std::chrono::high_resolution_clock::now();
+    
+    // ===== 階段 1.1: 找出所有單詞邊界 =====
+    int* d_word_starts;
+    int* d_word_count;
+    CUDA_CHECK(cudaMalloc(&d_word_starts, text_length * sizeof(int)));  // 最多有 text_length 個單詞
+    CUDA_CHECK(cudaMalloc(&d_word_count, sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_word_count, 0, sizeof(int)));
+    
+    int num_blocks_boundary = (text_length + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    find_word_boundaries<<<num_blocks_boundary, BLOCK_SIZE>>>(
+        d_text, text_length, d_word_starts, d_word_count);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    int h_word_count;
+    CUDA_CHECK(cudaMemcpy(&h_word_count, d_word_count, sizeof(int), cudaMemcpyDeviceToHost));
+    printf("  Found %d word boundaries\n", h_word_count);
+    
+    // ===== 階段 1.2: 處理每個單詞 =====
+    int max_map_output = h_word_count + 1000;  // 預留一些空間
     WordCount* d_map_output;
     int* d_output_count;
     CUDA_CHECK(cudaMalloc(&d_map_output, max_map_output * sizeof(WordCount)));
     CUDA_CHECK(cudaMalloc(&d_output_count, sizeof(int)));
     CUDA_CHECK(cudaMemset(d_output_count, 0, sizeof(int)));
     
-    // ============ PHASE 1: MAP ============
-    printf("Phase 1: MAP - Extracting words...\n");
-    
-    int num_blocks = (text_length + BLOCK_SIZE * 256 - 1) / (BLOCK_SIZE * 256);
-    num_blocks = std::min(num_blocks, 128);
-    if (num_blocks == 0) num_blocks = 1;
-    
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    
-    cudaEventRecord(start);
-    map_kernel<<<num_blocks, BLOCK_SIZE>>>(d_text, text_length, 
-                                           d_map_output, d_output_count,
-                                           max_map_output);
-    cudaEventRecord(stop);
+    int num_blocks_process = (h_word_count + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    process_words<<<num_blocks_process, BLOCK_SIZE>>>(
+        d_text, text_length, d_word_starts, h_word_count,
+        d_map_output, d_output_count, max_map_output);
     CUDA_CHECK(cudaDeviceSynchronize());
-    
-    float map_time;
-    cudaEventElapsedTime(&map_time, start, stop);
     
     int h_output_count;
     CUDA_CHECK(cudaMemcpy(&h_output_count, d_output_count, sizeof(int), cudaMemcpyDeviceToHost));
     printf("  Map output: %d (word, 1) pairs\n", h_output_count);
-    printf("  Map time: %.2f ms\n\n", map_time);
     
-    // ============ PHASE 2: SHUFFLE ============
-    printf("Phase 2: SHUFFLE - Sorting by word...\n");
+    // 清理階段 1 的臨時記憶體
+    CUDA_CHECK(cudaFree(d_word_starts));
+    CUDA_CHECK(cudaFree(d_word_count));
     
-    cudaEventRecord(start);
-    thrust::device_ptr<WordCount> d_ptr(d_map_output);
-    thrust::sort(thrust::device, d_ptr, d_ptr + h_output_count);
-    cudaEventRecord(stop);
-    CUDA_CHECK(cudaDeviceSynchronize());
+    // ============ PHASE 2: SHUFFLE (CPU-based) ============
+    printf("Phase 2: SHUFFLE - Sorting by word (CPU)...\n");
     
-    float shuffle_time;
-    cudaEventElapsedTime(&shuffle_time, start, stop);
-    printf("  Shuffle time: %.2f ms\n\n", shuffle_time);
+    // 開始 Shuffle 階段計時
+    auto shuffle_start_time = std::chrono::high_resolution_clock::now();
     
-    // ============ PHASE 3: REDUCE ============
-    printf("Phase 3: REDUCE - Aggregating counts...\n");
+    // 計算 Map 階段時間
+    std::chrono::duration<double, std::milli> map_duration = shuffle_start_time - map_start_time;
     
-    cudaEventRecord(start);
+    // 將 Map 結果從 GPU 拷貝到 CPU
+    std::vector<WordCount> h_map_output(h_output_count);
+    CUDA_CHECK(cudaMemcpy(h_map_output.data(), d_map_output, 
+                         h_output_count * sizeof(WordCount), cudaMemcpyDeviceToHost));
     
-    WordCount* d_reduced_keys;
-    int* d_reduced_counts;
-    CUDA_CHECK(cudaMalloc(&d_reduced_keys, h_output_count * sizeof(WordCount)));
-    CUDA_CHECK(cudaMalloc(&d_reduced_counts, h_output_count * sizeof(int)));
+    // CPU 端排序（使用 std::sort，比 thrust::sort 快很多）
+    std::sort(h_map_output.begin(), h_map_output.end());
     
-    thrust::device_ptr<WordCount> d_reduced_keys_ptr(d_reduced_keys);
-    thrust::device_ptr<int> d_reduced_counts_ptr(d_reduced_counts);
+    // ============ PHASE 3: REDUCE (CPU-based) ============
+    printf("Phase 3: REDUCE - Aggregating counts (CPU)...\n");
     
-    int* d_input_counts;
-    CUDA_CHECK(cudaMalloc(&d_input_counts, h_output_count * sizeof(int)));
-    thrust::device_ptr<int> d_input_counts_ptr(d_input_counts);
+    // 開始 Reduce 階段計時
+    auto reduce_start_time = std::chrono::high_resolution_clock::now();
     
-    thrust::transform(d_ptr, d_ptr + h_output_count, d_input_counts_ptr,
-                     [] __device__ (const WordCount& wc) { return wc.count; });
+    // 計算 Shuffle 階段時間
+    std::chrono::duration<double, std::milli> shuffle_duration = reduce_start_time - shuffle_start_time;
     
-    auto new_end = thrust::reduce_by_key(
-        d_ptr, d_ptr + h_output_count,
-        d_input_counts_ptr,
-        d_reduced_keys_ptr,
-        d_reduced_counts_ptr,
-        WordEqual()
-    );
+    // CPU 端 Reduce（手動實現 reduce_by_key）
+    std::vector<WordCount> h_results;
+    if (h_output_count > 0) {
+        WordCount current = h_map_output[0];
+        for (int i = 1; i < h_output_count; i++) {
+            if (current == h_map_output[i]) {
+                // 相同的 key，累加 count
+                current.count += h_map_output[i].count;
+            } else {
+                // 不同的 key，保存當前結果，開始新的 key
+                h_results.push_back(current);
+                current = h_map_output[i];
+            }
+        }
+        // 保存最後一個 key
+        h_results.push_back(current);
+    }
     
-    int unique_words = new_end.first - d_reduced_keys_ptr;
+    int unique_words = h_results.size();
     
-    cudaEventRecord(stop);
-    CUDA_CHECK(cudaDeviceSynchronize());
+    // 結束 Reduce 階段計時
+    auto end_time = std::chrono::high_resolution_clock::now();
     
-    float reduce_time;
-    cudaEventElapsedTime(&reduce_time, start, stop);
-    printf("  Unique words: %d\n", unique_words);
-    printf("  Reduce time: %.2f ms\n\n", reduce_time);
+    // 計算 Reduce 階段時間
+    std::chrono::duration<double, std::milli> reduce_duration = end_time - reduce_start_time;
     
     // ============ PHASE 4: OUTPUT ============
     printf("Phase 4: OUTPUT - Collecting results...\n");
-    
-    std::vector<WordCount> h_keys(unique_words);
-    std::vector<int> h_counts(unique_words);
-    CUDA_CHECK(cudaMemcpy(h_keys.data(), d_reduced_keys, 
-                         unique_words * sizeof(WordCount), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_counts.data(), d_reduced_counts, 
-                         unique_words * sizeof(int), cudaMemcpyDeviceToHost));
-    
-    std::vector<WordCount> h_results(unique_words);
-    for (int i = 0; i < unique_words; i++) {
-        h_results[i] = h_keys[i];
-        h_results[i].count = h_counts[i];
-    }
     
     std::sort(h_results.begin(), h_results.end(), 
               [](const WordCount& a, const WordCount& b) {
@@ -444,30 +415,16 @@ void mapreduce_wordcount(const std::string& text) {
               });
     
     // ==================== TIMING REPORT ====================
-    float total_time = map_time + shuffle_time + reduce_time;
+    // 計算總時間
+    std::chrono::duration<double, std::milli> total_duration = end_time - map_start_time;
     
-    printf("\n");
-    printf("╔════════════════════════════════════════════════════════╗\n");
-    printf("║         MapReduce Performance Report (CUDA)            ║\n");
-    printf("╠════════════════════════════════════════════════════════╣\n");
-    printf("║ Phase 1: MAP                                           ║\n");
-    printf("║   Time:        %8.2f ms  (%5.1f%%)                     ║\n", map_time, 100.0 * map_time / total_time);
-    printf("║   Output:      %8d (word, 1) pairs                     ║\n", h_output_count);
-    printf("║                                                        ║\n");
-    printf("║ Phase 2: SHUFFLE (Sort by key)                         ║\n");
-    printf("║   Time:        %8.2f ms  (%5.1f%%)                     ║\n", shuffle_time, 100.0 * shuffle_time / total_time);
-    printf("║                                                        ║\n");
-    printf("║ Phase 3: REDUCE (Aggregate by key)                     ║\n");
-    printf("║   Time:        %8.2f ms  (%5.1f%%)                     ║\n", reduce_time, 100.0 * reduce_time / total_time);
-    printf("║   Output:      %8d unique words                        ║\n", unique_words);
-    printf("║                                                        ║\n");
-    printf("╠════════════════════════════════════════════════════════╣\n");
-    printf("║ Total MapReduce Time:  %8.2f ms                       ║\n", total_time);
-    printf("║ Throughput:            %8.2f MB/s                   ║\n", (text.size() / 1024.0 / 1024.0) / (total_time / 1000.0));
-    printf("╚════════════════════════════════════════════════════════╝\n");
-    printf("\n");
+    // 使用與 C++ 版本相同的輸出格式
+    std::cout << "Total time: " << total_duration.count() << " ms" << std::endl;
+    std::cout << "Map Time    : " << map_duration.count() << " ms" << std::endl;
+    std::cout << "Shuffle Time: " << shuffle_duration.count() << " ms" << std::endl;
+    std::cout << "Reduce Time : " << reduce_duration.count() << " ms" << std::endl;
     
-    printf("=== Word Count Results ===\n");
+    printf("\n=== Word Count Results ===\n");
     for (const auto& wc : h_results) {
         printf("%s: %d\n", wc.word, wc.count);
     }
@@ -475,11 +432,6 @@ void mapreduce_wordcount(const std::string& text) {
     cudaFree(d_text);
     cudaFree(d_map_output);
     cudaFree(d_output_count);
-    cudaFree(d_reduced_keys);
-    cudaFree(d_reduced_counts);
-    cudaFree(d_input_counts);
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
 }
 
 int main(int argc, char** argv) {

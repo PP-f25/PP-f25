@@ -16,8 +16,8 @@ OMPFLAGS = -fopenmp
 PTHREADFLAGS = -pthread
 
 # CUDA (依你的 GPU 調整 compute_xx / sm_xx)
-CUDA_COMPILE_FLAGS = --device-c -gencode=arch=compute_61,code=sm_61 -Xcompiler "-fPIC" -g -O3
-CUDA_LINK_FLAGS    = -rdc=true -gencode=arch=compute_61,code=sm_61 -Xcompiler "-fPIC"
+# 使用 sm_50 以相容更多 GPU，並加入 --extended-lambda 支援 thrust lambda
+CUDA_FLAGS = --extended-lambda -arch=sm_50 -O3
 
 # --- 路徑與資料夾 ---
 OBJDIR    = objs
@@ -41,26 +41,9 @@ OMP_BIN     = WorldCount_map_reduce_omp
 MPI_BIN     = WorldCountMPI
 MPI_MR_BIN  = WorldCount_map_reduce_mpi
 
-# ==========================================
-# CUDA 區（從你的 Makefilecuda 合併而來）
-# ==========================================
-
-# CUDA 執行檔名字：**這裡改成你想要的名字**
-# 例如：CUDA_APP = hw5_cuda  或  CUDA_APP = mandelbrot
-CUDA_APP = cuda_app
-
-# 通常不用動：common/ppm.cpp
-PPM_SRC = $(COMMONDIR)/ppm.cpp
-PPM_OBJ = $(OBJDIR)/ppm.o
-
-# 這邊照你原本 Makefilecuda 寫的物件檔。
-# 如果你的 .cpp 檔名跟這些不一樣，就改這裡。
-CUDA_OBJS = \
-	$(OBJDIR)/main.o \
-	$(OBJDIR)/kernel.o \
-	$(OBJDIR)/mandelbrotSerial.o \
-	$(OBJDIR)/mandelbrotThread.o \
-	$(PPM_OBJ)
+# --- CUDA 版本 ---
+CUDA_SRC    = WorldCount_cuda.cu
+CUDA_BIN    = WorldCount_cuda
 
 # MPI 預設執行緒數量
 NP ?= 4
@@ -76,11 +59,18 @@ NP ?= 4
 all: dirs \
 	$(SEQ_BIN) $(MR_BIN) $(PTH_BIN) $(OMP_BIN) \
 	$(MPI_BIN) $(MPI_MR_BIN) \
-	$(CUDA_APP)
+	$(CUDA_BIN)
 
 # 建立物件檔資料夾
 dirs:
 	/bin/mkdir -p $(OBJDIR)/
+
+# ===========================
+# 編譯規則: CUDA WordCount
+# ===========================
+
+$(CUDA_BIN): $(CUDA_SRC)
+	$(NVCC) $(CUDA_FLAGS) -o $@ $<
 
 # ===========================
 # 編譯規則: World Count (CPU)
@@ -103,30 +93,6 @@ $(MPI_BIN): $(MPI_SRC)
 
 $(MPI_MR_BIN): $(MPI_MR_SRC)
 	$(MPICXX) $(CXXFLAGS) -o $@ $<
-
-# ===========================
-# 編譯規則: CUDA
-# ===========================
-
-# 最終 CUDA 執行檔
-$(CUDA_APP): dirs $(CUDA_OBJS)
-	$(NVCC) $(CUDA_LINK_FLAGS) -o $@ $(CUDA_OBJS) mandelbrotThreadRef.a
-
-# 一般 C++ -> .o（含 CUDA 專案用的 .cpp）
-$(OBJDIR)/%.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c -o $@ $<
-
-# common/*.cpp -> .o
-$(OBJDIR)/%.o: $(COMMONDIR)/%.cpp
-	$(CXX) $(CXXFLAGS) -c -o $@ $<
-
-# main.cpp 依賴 common/CycleTimer.h
-$(OBJDIR)/main.o: main.cpp $(COMMONDIR)/CycleTimer.h
-	$(CXX) $(CXXFLAGS) -c -o $@ $<
-
-# kernel.cu -> kernel.o
-$(OBJDIR)/kernel.o: kernel.cu kernel.h
-	$(NVCC) $(CUDA_COMPILE_FLAGS) -c kernel.cu -o $@
 
 # ===========================
 # 執行規則 (Run Targets)
@@ -156,14 +122,14 @@ run_mpi: $(MPI_BIN) $(MPI_MR_BIN)
 	@echo ">>> Running MPI (MapReduce) with $(NP) processes"
 	mpirun -np $(NP) ./$(MPI_MR_BIN)
 
-# run_cuda: $(CUDA_APP)
-# 	@echo ">>> Running CUDA app: $(CUDA_APP)"
-# 	./$(CUDA_APP)
+run_cuda: $(CUDA_BIN)
+	@echo ">>> Running CUDA WordCount"
+	./$(CUDA_BIN)
 
 # ===========================
 # 清除
 # ===========================
 
 clean:
-	rm -f $(SEQ_BIN) $(MR_BIN) $(PTH_BIN) $(OMP_BIN) $(MPI_BIN) $(MPI_MR_BIN) $(CUDA_APP)
+	rm -f $(SEQ_BIN) $(MR_BIN) $(PTH_BIN) $(OMP_BIN) $(MPI_BIN) $(MPI_MR_BIN) $(CUDA_BIN)
 	rm -rf $(OBJDIR) *.ppm *.out
