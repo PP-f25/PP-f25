@@ -13,7 +13,7 @@
 #include <stdlib.h>
 #include <algorithm>
 #include <iomanip>
-#include <chrono> // 引入 chrono
+#include <chrono>
 
 // --- 停用詞優化 ---
 const char * stopwords[] = {"a", "about", 
@@ -46,13 +46,13 @@ const char * stopwords[] = {"a", "about",
 
 std::unordered_set<std::string> stopwords_set;
 const char *dataset_path[] = {
-    // "../datasets/AChristmasCarol_CharlesDickens/AChristmasCarol_CharlesDickens_English.txt",
+        // "../datasets/AChristmasCarol_CharlesDickens/AChristmasCarol_CharlesDickens_English.txt",
     // "../datasets/KingSolomonsMines_HRiderHaggard/KingSolomonsMines_HRiderHaggard_English.txt",
     // "../datasets/OliverTwist_CharlesDickens/OliverTwist_CharlesDickens_English.txt",
-    //  "../datasets/Others/DonQuixote_MiguelCervantesSaavedra/DonQuixote_MiguelCervantesSaavedra_English.txt",
+    //"../datasets/Others/DonQuixote_MiguelCervantesSaavedra/DonQuixote_MiguelCervantesSaavedra_English.txt",
     // "../datasets/Others/NotreDameDeParis_VictorHugo/NotreDameDeParis_VictorHugo_English.txt",
     // "../datasets/Others/TheThreeMusketeers_AlexandreDumas/TheThreeMusketeers_AlexandreDumas_English.txt",
-    // "../datasets/TheAdventuresOfTomSawyer_MarkTwain/TheAdventuresOfTomSawyer_MarkTwain_English.txt",
+    // "../datasets/TheAdventuresOfTomSawyer_MarkTwain/TheAdventuresOfTomSawyer_MarkTwain_English.txt"
     // "../archive/text8"
     "../enwik9/enwik9"
 };
@@ -70,40 +70,54 @@ bool is_stopword_fast(const std::string& word) {
 }
 
 // --- 數據結構 ---
-
 struct KVPair {
     std::string key;
     int value;
 };
 
-// 3D 資料結構: [Producer_ID][Partition_ID][Data_Vector]
 using PartitionedData = std::vector<std::vector<std::vector<KVPair>>>;
 
-// Map 任務結構
-struct MapTaskArg {
+// 工作類型枚舉
+enum WorkType {
+    WORK_NONE,
+    WORK_MAP,
+    WORK_SHUFFLE,
+    WORK_REDUCE,
+    WORK_EXIT
+};
+
+// 統一的 Worker 結構
+struct WorkerThread {
+    int thread_id;
+    pthread_t handle;
+    
+    // 同步機制
+    pthread_mutex_t mutex;
+    pthread_cond_t cond_start;
+    pthread_cond_t cond_done;
+    
+    WorkType current_work;
+    bool work_ready;
+    bool work_completed;
+    
+    // Map 相關
     const char* text;
     size_t start_idx;
     size_t end_idx;
-    std::vector<KVPair>* local_result;
-};
-
-// Shuffle 任務結構
-struct ShuffleTaskArg {
-    int thread_id;
+    std::vector<KVPair>* map_result;
+    
+    // Shuffle 相關
     int num_partitions;
     const std::vector<std::vector<KVPair>>* map_outputs;
-    PartitionedData* partitions; // 指向 3D 結構
+    PartitionedData* partitions;
+    
+    // Reduce 相關
+    int partition_id;
+    int num_producers;
+    const PartitionedData* all_partitions;
+    std::vector<KVPair>* reduce_result;
 };
 
-// Reduce 任務結構
-struct ReduceTaskArg {
-    int partition_id; // 該執行緒負責的分區 ID
-    int num_producers; // Map 執行緒的總數 (生產者數量)
-    const PartitionedData* all_partitions; // 唯讀的 3D 結構來源
-    std::vector<KVPair>* local_result; // 該執行緒的 Reduce 結果
-};
-
-// 優化的分隔符檢查函數
 inline bool is_delimiter(char c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || 
            c == '.' || c == ',' || c == ';' || c == ':' || 
@@ -112,7 +126,6 @@ inline bool is_delimiter(char c) {
            c == '}' || c == '<' || c == '>' || c == '-' || c == '\'';
 }
 
-// 優化的 Map 函數
 std::vector<KVPair> map_func_optimized(const char* text, size_t start, size_t end) {
     std::vector<KVPair> mapped_data;
     mapped_data.reserve(1000); 
@@ -159,56 +172,198 @@ std::vector<KVPair> map_func_optimized(const char* text, size_t start, size_t en
     return mapped_data;
 }
 
-// Map thread function
-void* map_thread(void* arg) {
-    MapTaskArg* task = (MapTaskArg*)arg;
-    *task->local_result = map_func_optimized(task->text, task->start_idx, task->end_idx);
-    return NULL;
-}
-
-// Shuffle thread function (無鎖)
-void* shuffle_thread(void* arg) {
-    ShuffleTaskArg* task = (ShuffleTaskArg*)arg;
-    int tid = task->thread_id;
+// 統一的 Worker Thread 函數
+void* worker_thread_func(void* arg) {
+    WorkerThread* worker = (WorkerThread*)arg;
     
-    // 讀取自己 Map 階段的產出
-    const auto& local_vec = (*task->map_outputs)[tid];
-    
-    // 寫入自己的 Partition 區域 [tid][partition_id]
-    auto& my_partitions = (*task->partitions)[tid];
-    
-    for (const auto& kv : local_vec) {
-        std::size_t hash_val = std::hash<std::string>{}(kv.key);
-        int partition_idx = hash_val % task->num_partitions;
-        
-        my_partitions[partition_idx].push_back(kv);
-    }
-    return NULL;
-}
-
-// Reduce thread function
-void* reduce_thread(void* arg) {
-    ReduceTaskArg* task = (ReduceTaskArg*)arg;
-    int p = task->partition_id;
-    
-    // 使用局部 Map 統計
-    std::unordered_map<std::string, int> counts;
-    
-    // 遍歷所有生產者 (Map執行緒)
-    for (int t = 0; t < task->num_producers; ++t) {
-        const auto& data_chunk = (*task->all_partitions)[t][p];
-        for (const auto& kv : data_chunk) {
-            counts[kv.key] += kv.value;
+    while (true) {
+        // 等待工作
+        pthread_mutex_lock(&worker->mutex);
+        while (!worker->work_ready) {
+            pthread_cond_wait(&worker->cond_start, &worker->mutex);
         }
-    }
-    
-    // 將結果轉回 vector
-    task->local_result->reserve(counts.size());
-    for (const auto& pair : counts) {
-        task->local_result->push_back(KVPair{pair.first, pair.second});
+        
+        WorkType work = worker->current_work;
+        worker->work_ready = false;
+        pthread_mutex_unlock(&worker->mutex);
+        
+        // 執行工作
+        if (work == WORK_EXIT) {
+            break;
+        }
+        else if (work == WORK_MAP) {
+            *worker->map_result = map_func_optimized(
+                worker->text, 
+                worker->start_idx, 
+                worker->end_idx
+            );
+        }
+        else if (work == WORK_SHUFFLE) {
+            int tid = worker->thread_id;
+            const auto& local_vec = (*worker->map_outputs)[tid];
+            auto& my_partitions = (*worker->partitions)[tid];
+            
+            std::vector<size_t> partition_sizes(worker->num_partitions, 0);
+            for (const auto& kv : local_vec) {
+                std::size_t hash_val = std::hash<std::string>{}(kv.key);
+                int partition_idx = hash_val % worker->num_partitions;
+                partition_sizes[partition_idx]++;
+            }
+            for (int i = 0; i < worker->num_partitions; ++i) {
+                my_partitions[i].reserve(partition_sizes[i]);
+            }
+            
+            for (const auto& kv : local_vec) {
+                std::size_t hash_val = std::hash<std::string>{}(kv.key);
+                int partition_idx = hash_val % worker->num_partitions;
+                my_partitions[partition_idx].push_back(kv);
+            }
+        }
+        else if (work == WORK_REDUCE) {
+            int p = worker->partition_id;
+            
+            size_t total_items = 0;
+            for (int t = 0; t < worker->num_producers; ++t) {
+                total_items += (*worker->all_partitions)[t][p].size();
+            }
+            
+            std::unordered_map<std::string, int> counts;
+            counts.reserve(total_items / 2);
+            
+            for (int t = 0; t < worker->num_producers; ++t) {
+                const auto& data_chunk = (*worker->all_partitions)[t][p];
+                for (const auto& kv : data_chunk) {
+                    counts[kv.key] += kv.value;
+                }
+            }
+            
+            worker->reduce_result->reserve(counts.size());
+            for (const auto& pair : counts) {
+                worker->reduce_result->push_back(KVPair{pair.first, pair.second});
+            }
+        }
+        
+        // 通知完成
+        pthread_mutex_lock(&worker->mutex);
+        worker->work_completed = true;
+        pthread_cond_signal(&worker->cond_done);
+        pthread_mutex_unlock(&worker->mutex);
     }
     
     return NULL;
+}
+
+// 初始化 Worker Pool
+void init_worker_pool(std::vector<WorkerThread>& workers, int num_threads) {
+    workers.resize(num_threads);
+    for (int i = 0; i < num_threads; i++) {
+        workers[i].thread_id = i;
+        workers[i].current_work = WORK_NONE;
+        workers[i].work_ready = false;
+        workers[i].work_completed = false;
+        
+        pthread_mutex_init(&workers[i].mutex, NULL);
+        pthread_cond_init(&workers[i].cond_start, NULL);
+        pthread_cond_init(&workers[i].cond_done, NULL);
+        
+        pthread_create(&workers[i].handle, NULL, worker_thread_func, &workers[i]);
+    }
+}
+
+// 分配 Map 工作
+void dispatch_map_work(std::vector<WorkerThread>& workers, 
+                       const char* text, size_t content_size,
+                       std::vector<std::vector<KVPair>>& results) {
+    int num_threads = workers.size();
+    size_t chunk_size = content_size / num_threads;
+    
+    for (int i = 0; i < num_threads; i++) {
+        size_t start_idx = i * chunk_size;
+        size_t end_idx = (i == num_threads - 1) ? content_size : (i + 1) * chunk_size;
+        
+        if (i < num_threads - 1 && end_idx < content_size) {
+            while (end_idx < content_size && !is_delimiter(text[end_idx])) end_idx++;
+            while (end_idx < content_size && is_delimiter(text[end_idx])) end_idx++;
+        }
+        
+        pthread_mutex_lock(&workers[i].mutex);
+        workers[i].text = text;
+        workers[i].start_idx = start_idx;
+        workers[i].end_idx = end_idx;
+        workers[i].map_result = &results[i];
+        workers[i].current_work = WORK_MAP;
+        workers[i].work_ready = true;
+        workers[i].work_completed = false;
+        pthread_cond_signal(&workers[i].cond_start);
+        pthread_mutex_unlock(&workers[i].mutex);
+    }
+}
+
+// 分配 Shuffle 工作
+void dispatch_shuffle_work(std::vector<WorkerThread>& workers,
+                          const std::vector<std::vector<KVPair>>& map_outputs,
+                          PartitionedData& partitions) {
+    int num_threads = workers.size();
+    
+    for (int i = 0; i < num_threads; i++) {
+        pthread_mutex_lock(&workers[i].mutex);
+        workers[i].num_partitions = num_threads;
+        workers[i].map_outputs = &map_outputs;
+        workers[i].partitions = &partitions;
+        workers[i].current_work = WORK_SHUFFLE;
+        workers[i].work_ready = true;
+        workers[i].work_completed = false;
+        pthread_cond_signal(&workers[i].cond_start);
+        pthread_mutex_unlock(&workers[i].mutex);
+    }
+}
+
+// 分配 Reduce 工作
+void dispatch_reduce_work(std::vector<WorkerThread>& workers,
+                         const PartitionedData& partitions,
+                         std::vector<std::vector<KVPair>>& results) {
+    int num_threads = workers.size();
+    
+    for (int i = 0; i < num_threads; i++) {
+        pthread_mutex_lock(&workers[i].mutex);
+        workers[i].partition_id = i;
+        workers[i].num_producers = num_threads;
+        workers[i].all_partitions = &partitions;
+        workers[i].reduce_result = &results[i];
+        workers[i].current_work = WORK_REDUCE;
+        workers[i].work_ready = true;
+        workers[i].work_completed = false;
+        pthread_cond_signal(&workers[i].cond_start);
+        pthread_mutex_unlock(&workers[i].mutex);
+    }
+}
+
+// 等待所有工作完成
+void wait_all_workers(std::vector<WorkerThread>& workers) {
+    for (auto& worker : workers) {
+        pthread_mutex_lock(&worker.mutex);
+        while (!worker.work_completed) {
+            pthread_cond_wait(&worker.cond_done, &worker.mutex);
+        }
+        pthread_mutex_unlock(&worker.mutex);
+    }
+}
+
+// 清理 Worker Pool
+void cleanup_worker_pool(std::vector<WorkerThread>& workers) {
+    for (auto& worker : workers) {
+        pthread_mutex_lock(&worker.mutex);
+        worker.current_work = WORK_EXIT;
+        worker.work_ready = true;
+        pthread_cond_signal(&worker.cond_start);
+        pthread_mutex_unlock(&worker.mutex);
+        
+        pthread_join(worker.handle, NULL);
+        
+        pthread_mutex_destroy(&worker.mutex);
+        pthread_cond_destroy(&worker.cond_start);
+        pthread_cond_destroy(&worker.cond_done);
+    }
 }
 
 int main(int argc, char* argv[]) {
@@ -223,15 +378,15 @@ int main(int argc, char* argv[]) {
         }
     }
     
-    // 
-    // std::cout << "Running WorldCount (Pthreads Optimized - Lock Free) with " << num_threads << " threads (Chrono Timer)" << std::endl;
-
+    // 一次性創建執行緒池
+    std::vector<WorkerThread> workers;
+    init_worker_pool(workers, num_threads);
+    
     int num_datasets = sizeof(dataset_path) / sizeof(dataset_path[0]);
 
     for (int d = 0; d < num_datasets; ++d) {
         std::string filepath = dataset_path[d];
         std::string filename = filepath.substr(filepath.find_last_of("/\\") + 1);
-        // std::cout << "\n>>> Processing: " << filename << std::endl;
 
         std::ifstream ifs(dataset_path[d], std::ios::in);
         if (!ifs.is_open()) {
@@ -250,88 +405,36 @@ int main(int argc, char* argv[]) {
         size_t content_size = content.size();
 
         // --- Map Phase ---
-        auto map_start = std::chrono::high_resolution_clock::now(); 
-
-        pthread_t* map_threads = new pthread_t[num_threads];
-        MapTaskArg* map_tasks = new MapTaskArg[num_threads];
-        std::vector<std::vector<KVPair>> thread_mapped_results(num_threads); 
+        auto map_start = std::chrono::high_resolution_clock::now();
         
-        size_t chunk_size = content_size / num_threads;
-        
-        for (int i = 0; i < num_threads; i++) {
-            size_t start_idx = i * chunk_size;
-            size_t end_idx = (i == num_threads - 1) ? content_size : (i + 1) * chunk_size;
-            
-            if (i > 0 && start_idx < content_size) {
-                while (start_idx < content_size && !is_delimiter(text[start_idx])) start_idx++;
-                while (start_idx < content_size && is_delimiter(text[start_idx])) start_idx++;
-            }
-            
-            map_tasks[i].text = text;
-            map_tasks[i].start_idx = start_idx;
-            map_tasks[i].end_idx = end_idx;
-            map_tasks[i].local_result = &thread_mapped_results[i];
-            
-            pthread_create(&map_threads[i], NULL, map_thread, &map_tasks[i]);
-        }
-        
-        for (int i = 0; i < num_threads; i++) {
-            pthread_join(map_threads[i], NULL);
-        }
+        std::vector<std::vector<KVPair>> thread_mapped_results(num_threads);
+        dispatch_map_work(workers, text, content_size, thread_mapped_results);
+        wait_all_workers(workers);
         
         auto map_end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::milli> map_elapsed = map_end - map_start;
 
         // --- Shuffle Phase ---
         auto shuffle_start = std::chrono::high_resolution_clock::now();
-
+        
         PartitionedData partitions(num_threads, std::vector<std::vector<KVPair>>(num_threads));
-
-        pthread_t* shuffle_threads = new pthread_t[num_threads];
-        ShuffleTaskArg* shuffle_tasks = new ShuffleTaskArg[num_threads];
-
-        for (int i = 0; i < num_threads; ++i) {
-            shuffle_tasks[i].thread_id = i;
-            shuffle_tasks[i].num_partitions = num_threads;
-            shuffle_tasks[i].map_outputs = &thread_mapped_results;
-            shuffle_tasks[i].partitions = &partitions;
-
-            pthread_create(&shuffle_threads[i], NULL, shuffle_thread, &shuffle_tasks[i]);
-        }
-
-        for (int i = 0; i < num_threads; ++i) {
-            pthread_join(shuffle_threads[i], NULL);
-        }
-
+        dispatch_shuffle_work(workers, thread_mapped_results, partitions);
+        wait_all_workers(workers);
+        
         auto shuffle_end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::milli> shuffle_elapsed = shuffle_end - shuffle_start;
 
         // --- Reduce Phase ---
         auto reduce_start = std::chrono::high_resolution_clock::now();
-
-        pthread_t* reduce_threads = new pthread_t[num_threads];
-        ReduceTaskArg* reduce_tasks = new ReduceTaskArg[num_threads];
+        
         std::vector<std::vector<KVPair>> thread_reduce_results(num_threads);
-
-        for (int i = 0; i < num_threads; ++i) {
-            reduce_tasks[i].partition_id = i;
-            reduce_tasks[i].num_producers = num_threads;
-            reduce_tasks[i].all_partitions = &partitions;
-            reduce_tasks[i].local_result = &thread_reduce_results[i];
-
-            pthread_create(&reduce_threads[i], NULL, reduce_thread, &reduce_tasks[i]);
-        }
-
-        for (int i = 0; i < num_threads; ++i) {
-            pthread_join(reduce_threads[i], NULL);
-        }
-
-        // 最終合併
+        dispatch_reduce_work(workers, partitions, thread_reduce_results);
+        wait_all_workers(workers);
+        
         std::vector<KVPair> final_results;
         size_t total_final_size = 0;
         for (const auto& vec : thread_reduce_results) total_final_size += vec.size();
         final_results.reserve(total_final_size);
-
         for (const auto& vec : thread_reduce_results) {
             final_results.insert(final_results.end(), vec.begin(), vec.end());
         }
@@ -341,29 +444,25 @@ int main(int argc, char* argv[]) {
         std::chrono::duration<double, std::milli> total_elapsed = reduce_end - map_start;
 
         // ===== Print Results =====
-        std::cout << "--- Word Count MapReduce Results (Verify) ---" << std::endl;
+        std::cout << "--- Word Count MapReduce Results (Reusable Threads) ---" << std::endl;
         int count = 0;
         for (auto& pair : final_results) {
             if (pair.value > 100000) {
+                std::cout << pair.key << ": " << pair.value << std::endl;
                 count++;
             }
         }
-        // std::cout << "Total unique words > 100: " << count << std::endl;
+        // std::cout << "Total unique words > 500: " << count << std::endl;
 
         std::cout << std::fixed << std::setprecision(3);
         std::cout << "Total Time  : " << total_elapsed.count() << " ms" << std::endl;
         std::cout << "Map Time    : " << map_elapsed.count() << " ms" << std::endl;
         std::cout << "Shuffle Time: " << shuffle_elapsed.count() << " ms" << std::endl;
         std::cout << "Reduce Time : " << reduce_elapsed.count() << " ms" << std::endl;
-
-        // 清理
-        delete[] map_threads;
-        delete[] map_tasks;
-        delete[] shuffle_threads;
-        delete[] shuffle_tasks;
-        delete[] reduce_threads;
-        delete[] reduce_tasks;
     }
+    
+    // 清理執行緒池
+    cleanup_worker_pool(workers);
 
     return 0;
 }
