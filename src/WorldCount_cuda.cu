@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cctype>
 #include <algorithm>
+#include <map>
 #include <chrono>
 #include <cuda_runtime.h>
 #include <thrust/device_vector.h>
@@ -354,8 +355,8 @@ void mapreduce_wordcount(const std::string& text) {
     CUDA_CHECK(cudaFree(d_word_starts));
     CUDA_CHECK(cudaFree(d_word_count));
     
-    // ============ PHASE 2: SHUFFLE (CPU-based) ============
-    printf("Phase 2: SHUFFLE - Sorting by word (CPU)...\n");
+    // ============ PHASE 2: SHUFFLE ============
+    printf("Phase 2: SHUFFLE - Sorting by word (using GPU Thrust)...\n");
     
     // 開始 Shuffle 階段計時
     auto shuffle_start_time = std::chrono::high_resolution_clock::now();
@@ -363,16 +364,13 @@ void mapreduce_wordcount(const std::string& text) {
     // 計算 Map 階段時間
     std::chrono::duration<double, std::milli> map_duration = shuffle_start_time - map_start_time;
     
-    // 將 Map 結果從 GPU 拷貝到 CPU
-    std::vector<WordCount> h_map_output(h_output_count);
-    CUDA_CHECK(cudaMemcpy(h_map_output.data(), d_map_output, 
-                         h_output_count * sizeof(WordCount), cudaMemcpyDeviceToHost));
+    // 使用 Thrust 在 GPU 上進行排序
+    thrust::device_ptr<WordCount> d_ptr(d_map_output);
+    thrust::sort(thrust::device, d_ptr, d_ptr + h_output_count);
+    CUDA_CHECK(cudaDeviceSynchronize());  // 等待 Shuffle 完成
     
-    // CPU 端排序（使用 std::sort，比 thrust::sort 快很多）
-    std::sort(h_map_output.begin(), h_map_output.end());
-    
-    // ============ PHASE 3: REDUCE (CPU-based) ============
-    printf("Phase 3: REDUCE - Aggregating counts (CPU)...\n");
+    // ============ PHASE 3: REDUCE ============
+    printf("Phase 3: REDUCE - Aggregating counts (using GPU Thrust)...\n");
     
     // 開始 Reduce 階段計時
     auto reduce_start_time = std::chrono::high_resolution_clock::now();
@@ -380,31 +378,54 @@ void mapreduce_wordcount(const std::string& text) {
     // 計算 Shuffle 階段時間
     std::chrono::duration<double, std::milli> shuffle_duration = reduce_start_time - shuffle_start_time;
     
-    // CPU 端 Reduce（手動實現 reduce_by_key）
-    std::vector<WordCount> h_results;
-    if (h_output_count > 0) {
-        WordCount current = h_map_output[0];
-        for (int i = 1; i < h_output_count; i++) {
-            if (current == h_map_output[i]) {
-                // 相同的 key，累加 count
-                current.count += h_map_output[i].count;
-            } else {
-                // 不同的 key，保存當前結果，開始新的 key
-                h_results.push_back(current);
-                current = h_map_output[i];
-            }
-        }
-        // 保存最後一個 key
-        h_results.push_back(current);
-    }
+    // 在 GPU 上使用 Thrust reduce_by_key 進行聚合
+    WordCount* d_reduced_keys;
+    int* d_reduced_counts;
+    CUDA_CHECK(cudaMalloc(&d_reduced_keys, h_output_count * sizeof(WordCount)));
+    CUDA_CHECK(cudaMalloc(&d_reduced_counts, h_output_count * sizeof(int)));
     
-    int unique_words = h_results.size();
+    thrust::device_ptr<WordCount> d_reduced_keys_ptr(d_reduced_keys);
+    thrust::device_ptr<int> d_reduced_counts_ptr(d_reduced_counts);
+    
+    // 準備輸入的 counts (都是 1)
+    int* d_input_counts;
+    CUDA_CHECK(cudaMalloc(&d_input_counts, h_output_count * sizeof(int)));
+    thrust::device_ptr<int> d_input_counts_ptr(d_input_counts);
+    
+    thrust::transform(d_ptr, d_ptr + h_output_count, d_input_counts_ptr,
+                     [] __device__ (const WordCount& wc) { return wc.count; });
+    
+    auto new_end = thrust::reduce_by_key(
+        d_ptr, d_ptr + h_output_count,
+        d_input_counts_ptr,
+        d_reduced_keys_ptr,
+        d_reduced_counts_ptr,
+        WordEqual()
+    );
+    
+    int unique_words = new_end.first - d_reduced_keys_ptr;
+    CUDA_CHECK(cudaDeviceSynchronize());  // 等待 Reduce 完成
     
     // 結束 Reduce 階段計時
     auto end_time = std::chrono::high_resolution_clock::now();
     
     // 計算 Reduce 階段時間
     std::chrono::duration<double, std::milli> reduce_duration = end_time - reduce_start_time;
+    
+    // 將結果從 GPU 複製到 CPU 用於輸出
+    std::vector<WordCount> h_keys(unique_words);
+    std::vector<int> h_counts(unique_words);
+    CUDA_CHECK(cudaMemcpy(h_keys.data(), d_reduced_keys, 
+                         unique_words * sizeof(WordCount), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_counts.data(), d_reduced_counts, 
+                         unique_words * sizeof(int), cudaMemcpyDeviceToHost));
+    
+    // 組合結果
+    std::vector<WordCount> h_results(unique_words);
+    for (int i = 0; i < unique_words; i++) {
+        h_results[i] = h_keys[i];
+        h_results[i].count = h_counts[i];
+    }
     
     // ============ PHASE 4: OUTPUT ============
     printf("Phase 4: OUTPUT - Collecting results...\n");
@@ -424,14 +445,18 @@ void mapreduce_wordcount(const std::string& text) {
     std::cout << "Shuffle Time: " << shuffle_duration.count() << " ms" << std::endl;
     std::cout << "Reduce Time : " << reduce_duration.count() << " ms" << std::endl;
     
-    printf("\n=== Word Count Results ===\n");
-    for (const auto& wc : h_results) {
-        printf("%s: %d\n", wc.word, wc.count);
-    }
+    // printf("\n=== Word Count Results ===\n");
+    // for (const auto& wc : h_results) {
+    //     printf("%s: %d\n", wc.word, wc.count);
+    // }
     
+    // 清理 GPU 記憶體
     cudaFree(d_text);
     cudaFree(d_map_output);
     cudaFree(d_output_count);
+    cudaFree(d_reduced_keys);
+    cudaFree(d_reduced_counts);
+    cudaFree(d_input_counts);
 }
 
 int main(int argc, char** argv) {
