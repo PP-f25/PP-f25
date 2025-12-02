@@ -98,6 +98,13 @@ struct HashEntry {
     int count;          // 出現次數
 };
 
+// Shuffle 輸出：(key, list<value>) 格式
+struct ShuffleGroup {
+    char word[MAX_WORD_LENGTH];   // key
+    int* values;                   // list of values (動態分配)
+    int num_values;                // list 長度
+};
+
 struct WordEqual {
     __host__ __device__
     bool operator()(const WordCount& a, const WordCount& b) const {
@@ -335,16 +342,16 @@ __global__ void process_words(char* text, int text_length,
 // ==================== Hash-based Shuffle Kernel ====================
 
 /**
- * Hash-based Shuffle Kernel
- * 使用 hash table 進行分組，替代 Thrust Sort
- * 輸入：所有 (word, 1) pairs
- * 輸出：Hash table with aggregated counts
+ * Phase 1: 找出每個 word 對應的 group ID
+ * 這個 kernel 只做 hash table 的建立和 group assignment
  */
-__global__ void shuffle_hash_grouping_kernel(
+__global__ void shuffle_assign_groups_kernel(
     WordCount* map_output,
     int num_pairs,
-    HashEntry* hash_table,
-    int* unique_count
+    int* group_indices,      // 輸出：每個 pair 分配到哪個組
+    int* group_sizes,        // 輸出：每個組有多少個 values (原子計數)
+    char (*unique_words)[MAX_WORD_LENGTH],  // 輸出：每個組的 word
+    int* num_groups          // 輸出：總共有多少個不同的 word
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int total_threads = gridDim.x * blockDim.x;
@@ -358,34 +365,130 @@ __global__ void shuffle_hash_grouping_kernel(
         // 計算 hash
         uint64_t hash = compute_hash(word, word_len);
         int slot = hash % HASH_TABLE_SIZE;
-        bool inserted = false;
+        bool found = false;
+        int group_id = -1;
         
-        // Linear probing with atomic operations
-        for (int probe = 0; probe < 256 && !inserted; probe++) {
+        // Linear probing 找到或創建 group
+        for (int probe = 0; probe < 256 && !found; probe++) {
             int idx = (slot + probe) % HASH_TABLE_SIZE;
             
-            unsigned long long old = atomicCAS(
-                (unsigned long long*)&hash_table[idx].key_hash,
-                EMPTY_KEY,
-                hash
-            );
+            // 嘗試讀取這個 slot
+            int current_size = atomicAdd(&group_sizes[idx], 0);  // 原子讀取
             
-            if (old == EMPTY_KEY) {
-                // 新 key，插入
-                for (int j = 0; j < MAX_WORD_LENGTH; j++) {
-                    hash_table[idx].word[j] = word[j];
-                    if (word[j] == '\0') break;
+            if (current_size == 0) {
+                // 空 slot，嘗試創建新 group
+                int old = atomicCAS(&group_sizes[idx], 0, 1);
+                if (old == 0) {
+                    // 成功創建新 group
+                    for (int j = 0; j < MAX_WORD_LENGTH; j++) {
+                        unique_words[idx][j] = word[j];
+                        if (word[j] == '\0') break;
+                    }
+                    atomicAdd(num_groups, 1);
+                    group_id = idx;
+                    found = true;
+                } else {
+                    // 其他 thread 搶先創建了，重新檢查
+                    if (str_equal_device(unique_words[idx], word)) {
+                        atomicAdd(&group_sizes[idx], 1);
+                        group_id = idx;
+                        found = true;
+                    }
                 }
-                atomicAdd(&hash_table[idx].count, 1);
-                atomicAdd(unique_count, 1);
-                inserted = true;
-            } 
-            else if (old == hash && str_equal_device(hash_table[idx].word, word)) {
-                // 相同 key，累加
-                atomicAdd(&hash_table[idx].count, 1);
-                inserted = true;
+            } else {
+                // slot 已被佔用，檢查是否相同 word
+                if (str_equal_device(unique_words[idx], word)) {
+                    atomicAdd(&group_sizes[idx], 1);
+                    group_id = idx;
+                    found = true;
+                }
             }
         }
+        
+        // 記錄這個 pair 屬於哪個 group
+        if (group_id != -1) {
+            group_indices[i] = group_id;
+        }
+    }
+}
+
+/**
+ * Phase 2: 構建 (key, list<value>) 格式的 Shuffle 輸出
+ * 把每個 pair 的 value (都是 1) 放到對應 group 的 list 中
+ */
+__global__ void shuffle_build_lists_kernel(
+    WordCount* map_output,
+    int num_pairs,
+    int* group_indices,
+    int* group_offsets,      // 每個 group 在 value_lists 中的起始位置
+    int* group_positions,    // 每個 group 當前插入的位置 (原子遞增)
+    int* value_lists         // 所有 groups 的 values (flattened array)
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_threads = gridDim.x * blockDim.x;
+    
+    for (int i = tid; i < num_pairs; i += total_threads) {
+        int group_id = group_indices[i];
+        if (group_id == -1) continue;
+        
+        // 取得這個 value 在 group 的 list 中的位置
+        int pos_in_group = atomicAdd(&group_positions[group_id], 1);
+        int global_pos = group_offsets[group_id] + pos_in_group;
+        
+        // 寫入 value (都是 1)
+        value_lists[global_pos] = map_output[i].count;
+    }
+}
+
+/**
+ * Reduce Kernel (修正版)
+ * 輸入：(key, list<value>) 格式
+ * 功能：對每個 key 的 value list 進行聚合
+ * 輸出：(key, aggregated_value)
+ * 
+ * 標準 Reduce 函數定義：
+ * reduce(key, [v1, v2, v3, ...]) → (key, aggregated_result)
+ * 
+ * 範例：
+ * reduce("the", [1, 1, 1, 1]) → ("the", 4)
+ * reduce("cat", [1, 1])       → ("cat", 2)
+ */
+__global__ void reduce_kernel(
+    char (*unique_words)[MAX_WORD_LENGTH],
+    int* group_offsets,
+    int* group_sizes,
+    int* value_lists,
+    WordCount* final_results,
+    int* result_count
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= HASH_TABLE_SIZE) return;
+    
+    // 如果這個 group 有資料
+    if (group_sizes[idx] > 0) {
+        int pos = atomicAdd(result_count, 1);
+        
+        // 複製 key (word)
+        for (int i = 0; i < MAX_WORD_LENGTH; i++) {
+            final_results[pos].word[i] = unique_words[idx][i];
+            if (unique_words[idx][i] == '\0') break;
+        }
+        
+        // 聚合：對 value list 求和
+        // 輸入：key = unique_words[idx]
+        //       values = value_lists[offset ... offset+num_values-1]
+        // 輸出：sum = values 的總和
+        int sum = 0;
+        int offset = group_offsets[idx];
+        int num_values = group_sizes[idx];
+        
+        // reduce(key, [v1, v2, ..., vN]) 的實作
+        for (int i = 0; i < num_values; i++) {
+            sum += value_lists[offset + i];  // 每個 value 都是 1
+        }
+        
+        final_results[pos].count = sum;
     }
 }
 
@@ -485,64 +588,144 @@ void mapreduce_wordcount_hash_shuffle(const std::string& text) {
     auto shuffle_start_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> map_duration = shuffle_start_time - map_start_time;
     
-    // ============ PHASE 2: SHUFFLE (Hash-based Grouping) ============
-    printf("Phase 2: SHUFFLE - Hash-based grouping (optimized)...\n");
+    // ============ PHASE 2: SHUFFLE (構建 (key, list<value>) 格式) ============
+    printf("Phase 2: SHUFFLE - 構建 (key, list<value>) 格式...\n");
     
-    // 分配 hash table
-    HashEntry* d_hash_table;
-    int* d_unique_count;
-    CUDA_CHECK(cudaMalloc(&d_hash_table, HASH_TABLE_SIZE * sizeof(HashEntry)));
-    CUDA_CHECK(cudaMalloc(&d_unique_count, sizeof(int)));
+    // 分配資料結構
+    int* d_group_indices;
+    int* d_group_sizes;
+    char (*d_unique_words)[MAX_WORD_LENGTH];
+    int* d_num_groups;
     
-    // 初始化 hash table
-    std::vector<HashEntry> init_table(HASH_TABLE_SIZE);
-    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
-        init_table[i].key_hash = EMPTY_KEY;
-        init_table[i].count = 0;
-        init_table[i].word[0] = '\0';
-    }
-    CUDA_CHECK(cudaMemcpy(d_hash_table, init_table.data(), 
-                         HASH_TABLE_SIZE * sizeof(HashEntry), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(d_unique_count, 0, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_group_indices, h_output_count * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_group_sizes, HASH_TABLE_SIZE * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_unique_words, HASH_TABLE_SIZE * MAX_WORD_LENGTH));
+    CUDA_CHECK(cudaMalloc(&d_num_groups, sizeof(int)));
     
-    // 執行 hash-based grouping
+    CUDA_CHECK(cudaMemset(d_group_indices, -1, h_output_count * sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_group_sizes, 0, HASH_TABLE_SIZE * sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_num_groups, 0, sizeof(int)));
+    
+    // Stage 2.1: 分配每個 pair 到 group，並統計每個 group 的大小
+    printf("  Stage 2.1: Assigning pairs to groups...\n");
     int num_blocks_shuffle = (h_output_count + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    num_blocks_shuffle = min(num_blocks_shuffle, 256);  // 限制 blocks 數量
+    num_blocks_shuffle = min(num_blocks_shuffle, 256);
     
-    shuffle_hash_grouping_kernel<<<num_blocks_shuffle, BLOCK_SIZE>>>(
+    shuffle_assign_groups_kernel<<<num_blocks_shuffle, BLOCK_SIZE>>>(
         d_map_output, h_output_count,
-        d_hash_table, d_unique_count
+        d_group_indices, d_group_sizes, d_unique_words, d_num_groups
     );
     CUDA_CHECK(cudaDeviceSynchronize());
+    
+    int h_num_groups;
+    CUDA_CHECK(cudaMemcpy(&h_num_groups, d_num_groups, sizeof(int), cudaMemcpyDeviceToHost));
+    printf("  Found %d unique words (groups)\n", h_num_groups);
+    
+    // Stage 2.2: 計算每個 group 在 value_lists 中的偏移量 (prefix sum)
+    printf("  Stage 2.2: Computing offsets for value lists...\n");
+    std::vector<int> h_group_sizes(HASH_TABLE_SIZE);
+    CUDA_CHECK(cudaMemcpy(h_group_sizes.data(), d_group_sizes,
+                         HASH_TABLE_SIZE * sizeof(int), cudaMemcpyDeviceToHost));
+    
+    std::vector<int> h_group_offsets(HASH_TABLE_SIZE);
+    int total_values = 0;
+    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
+        h_group_offsets[i] = total_values;
+        total_values += h_group_sizes[i];
+    }
+    
+    int* d_group_offsets;
+    CUDA_CHECK(cudaMalloc(&d_group_offsets, HASH_TABLE_SIZE * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(d_group_offsets, h_group_offsets.data(),
+                         HASH_TABLE_SIZE * sizeof(int), cudaMemcpyHostToDevice));
+    
+    // Stage 2.3: 構建實際的 value lists
+    printf("  Stage 2.3: Building value lists (total %d values)...\n", total_values);
+    int* d_value_lists;
+    int* d_group_positions;
+    CUDA_CHECK(cudaMalloc(&d_value_lists, total_values * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_group_positions, HASH_TABLE_SIZE * sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_group_positions, 0, HASH_TABLE_SIZE * sizeof(int)));
+    
+    shuffle_build_lists_kernel<<<num_blocks_shuffle, BLOCK_SIZE>>>(
+        d_map_output, h_output_count,
+        d_group_indices, d_group_offsets, d_group_positions, d_value_lists
+    );
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    printf("  Shuffle 完成！輸出格式：(key, list<value>)\n");
+    
+    printf("  Shuffle 完成！輸出格式：(key, list<value>)\n");
+    
+    // ===== DEBUG: 顯示 Shuffle 輸出 (key, list<value>) 格式 =====
+    printf("\n--- Shuffle 輸出：(key, list<value>) 格式 (前 5 個 groups) ---\n");
+    
+    char (*h_unique_words)[MAX_WORD_LENGTH] = new char[HASH_TABLE_SIZE][MAX_WORD_LENGTH];
+    std::vector<int> h_value_lists(total_values);
+    
+    CUDA_CHECK(cudaMemcpy(h_unique_words, d_unique_words,
+                         HASH_TABLE_SIZE * MAX_WORD_LENGTH, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_value_lists.data(), d_value_lists,
+                         total_values * sizeof(int), cudaMemcpyDeviceToHost));
+    
+    int shown = 0;
+    for (int i = 0; i < HASH_TABLE_SIZE && shown < 5; i++) {
+        if (h_group_sizes[i] > 0) {
+            printf("Group %d: key=\"%s\", values=[", i, h_unique_words[i]);
+            int offset = h_group_offsets[i];
+            int count = h_group_sizes[i];
+            
+            // 顯示前 10 個 values
+            int show_limit = (count > 10) ? 10 : count;
+            for (int j = 0; j < show_limit; j++) {
+                printf("%d", h_value_lists[offset + j]);
+                if (j < show_limit - 1) printf(", ");
+            }
+            if (count > 10) printf(", ... (%d more)", count - 10);
+            printf("]\n");
+            shown++;
+        }
+    }
+    printf("說明：這就是標準的 (key, list<value>) 格式！\n");
+    printf("  - key: 單詞本身\n");
+    printf("  - values: 一個 list，包含所有出現的 values (都是 1)\n");
+    printf("  → Reduce 階段會對這個 list 求和\n");
+    printf("\n範例驗證：\n");
+    printf("  reduce(\"duty\", [1, 1, ..., 1] (32個)) → (\"duty\", 32)\n");
+    printf("  reduce(\"zancas\", [1, 1])            → (\"zancas\", 2)\n");
+    printf("---\n\n");
+    
+    delete[] h_unique_words;
     
     auto reduce_start_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> shuffle_duration = reduce_start_time - shuffle_start_time;
     
-    // ============ PHASE 3: REDUCE ============
-    printf("Phase 3: REDUCE - Collecting results from hash table...\n");
+    // ============ PHASE 3: REDUCE (Aggregation) ============
+    printf("Phase 3: REDUCE - 對每個 (key, list<value>) 執行聚合...\n");
+    
+    // 分配 reduce 輸出
+    WordCount* d_final_results;
+    int* d_result_count;
+    CUDA_CHECK(cudaMalloc(&d_final_results, HASH_TABLE_SIZE * sizeof(WordCount)));
+    CUDA_CHECK(cudaMalloc(&d_result_count, sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_result_count, 0, sizeof(int)));
+    
+    // 執行 Reduce：對每個 key 的 value list 進行聚合
+    int num_blocks_reduce = (HASH_TABLE_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    reduce_kernel<<<num_blocks_reduce, BLOCK_SIZE>>>(
+        d_unique_words, d_group_offsets, d_group_sizes, d_value_lists,
+        d_final_results, d_result_count
+    );
+    CUDA_CHECK(cudaDeviceSynchronize());
     
     // 複製結果回 CPU
-    std::vector<HashEntry> h_hash_table(HASH_TABLE_SIZE);
-    int h_unique_count;
-    CUDA_CHECK(cudaMemcpy(h_hash_table.data(), d_hash_table,
-                         HASH_TABLE_SIZE * sizeof(HashEntry),
+    int h_result_count;
+    CUDA_CHECK(cudaMemcpy(&h_result_count, d_result_count, sizeof(int), cudaMemcpyDeviceToHost));
+    
+    std::vector<WordCount> h_results(h_result_count);
+    CUDA_CHECK(cudaMemcpy(h_results.data(), d_final_results,
+                         h_result_count * sizeof(WordCount),
                          cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&h_unique_count, d_unique_count, sizeof(int), cudaMemcpyDeviceToHost));
-    
-    // 收集結果
-    std::vector<WordCount> h_results;
-    h_results.reserve(h_unique_count + 100);
-    
-    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
-        const HashEntry& entry = h_hash_table[i];
-        if (entry.key_hash != EMPTY_KEY && entry.count > 0) {
-            WordCount wc;
-            strncpy(wc.word, entry.word, MAX_WORD_LENGTH - 1);
-            wc.word[MAX_WORD_LENGTH - 1] = '\0';
-            wc.count = entry.count;
-            h_results.push_back(wc);
-        }
-    }
     
     auto reduce_end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> reduce_duration = reduce_end_time - reduce_start_time;
@@ -561,9 +744,9 @@ void mapreduce_wordcount_hash_shuffle(const std::string& text) {
     printf("Total time  : %.2f ms\n", total_duration.count());
     printf("Map Time    : %.2f ms (%.1f%%) ← Produces %d (word,1) pairs\n", 
            map_duration.count(), map_duration.count() / total_duration.count() * 100, h_output_count);
-    printf("Shuffle Time: %.2f ms (%.1f%%) ← Hash-based grouping (NOT sort!)\n", 
-           shuffle_duration.count(), shuffle_duration.count() / total_duration.count() * 100);
-    printf("Reduce Time : %.2f ms (%.1f%%)\n", 
+    printf("Shuffle Time: %.2f ms (%.1f%%) ← 構建 %d 個 (key, list<value>) groups\n", 
+           shuffle_duration.count(), shuffle_duration.count() / total_duration.count() * 100, h_num_groups);
+    printf("Reduce Time : %.2f ms (%.1f%%) ← 對每個 list 求和\n", 
            reduce_duration.count(), reduce_duration.count() / total_duration.count() * 100);
     
     printf("\n=== Word Count Results (Top 20) ===\n");
@@ -578,8 +761,15 @@ void mapreduce_wordcount_hash_shuffle(const std::string& text) {
     cudaFree(d_text);
     cudaFree(d_map_output);
     cudaFree(d_output_count);
-    cudaFree(d_hash_table);
-    cudaFree(d_unique_count);
+    cudaFree(d_group_indices);
+    cudaFree(d_group_sizes);
+    cudaFree(d_unique_words);
+    cudaFree(d_num_groups);
+    cudaFree(d_group_offsets);
+    cudaFree(d_group_positions);
+    cudaFree(d_value_lists);
+    cudaFree(d_final_results);
+    cudaFree(d_result_count);
 }
 
 // ==================== Main Function ====================
@@ -595,6 +785,10 @@ int main(int argc, char** argv) {
         return 1;
     }
     
+    // 執行完整標準 MapReduce (完全正確版本)
+    // MAP: 產生 (word, 1) pairs
+    // SHUFFLE: 構建 (key, list<value>) 格式 ← 真正的 Shuffle 輸出！
+    // REDUCE: 對每個 (key, list<value>) 執行聚合函數
     mapreduce_wordcount_hash_shuffle(text);
     
     return 0;
